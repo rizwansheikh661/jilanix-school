@@ -1,0 +1,199 @@
+// ---------------------------------------------------------------------------
+// flags.prisma — Feature flags foundation (Sprint 5).
+//
+// Five tables back the feature-flag system:
+//
+//   * FeatureFlagDefinition   — code-side registered flag with default value
+//                               + lifecycle. PLATFORM_ONLY (one row per flag,
+//                               shared across tenants).
+//   * FeatureFlagPlanMap      — plan default that wins over the definition
+//                               default. Plan FK is opaque CHAR(36) for now;
+//                               wired to a real `plans` table in Sprint 7.
+//   * FeatureFlagTenantOverride — per-school override. TENANT_OWNED; the
+//                               (schoolId, flagId, expires_at) unique-while-
+//                               active is enforced via STORED column
+//                               `expires_at_key` (added in migration).
+//   * FeatureFlagRollout       — percentage / list-based gradual rollout.
+//                               PLATFORM_ONLY.
+//   * FeatureFlagAuditLog      — append-only change log across all four
+//                               above. TENANT_SHARED_PLATFORM (school_id
+//                               nullable for plan/system changes).
+//
+// Evaluation order at runtime:
+//   active rollout match  >  tenant override (non-expired)
+//   >  plan map (school's current plan)  >  definition default.
+// ---------------------------------------------------------------------------
+
+enum FeatureFlagKind {
+  MODULE
+  RELEASE
+  EXPERIMENT
+  KILL_SWITCH
+  ENTITLEMENT
+}
+
+enum FeatureFlagLifecycle {
+  INTRODUCED
+  ACTIVE
+  DEPRECATED
+  RETIRED
+}
+
+enum RolloutStrategy {
+  PERCENTAGE
+  TENANT_LIST
+  PLAN_LIST
+  REGION_LIST
+}
+
+/// @scope PLATFORM_ONLY
+/// @audit category=general
+model FeatureFlagDefinition {
+  id String @id @default(uuid()) @db.Char(36)
+
+  // Dotted key, e.g. 'module.fees', 'feature.notification.whatsapp'.
+  key          String               @db.VarChar(100)
+  name         String               @db.VarChar(120)
+  description  String?              @db.VarChar(500)
+  kind         FeatureFlagKind      @default(MODULE)
+  owner        String?              @db.VarChar(80)
+  defaultValue Boolean              @default(false) @map("default_value")
+  lifecycle    FeatureFlagLifecycle @default(INTRODUCED)
+  cleanupDueAt DateTime?            @map("cleanup_due_at") @db.Date
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  planMaps        FeatureFlagPlanMap[]        @relation("FeatureFlagDefinitionPlans")
+  tenantOverrides FeatureFlagTenantOverride[] @relation("FeatureFlagDefinitionTenants")
+  rollouts        FeatureFlagRollout[]        @relation("FeatureFlagDefinitionRollouts")
+  auditLogs       FeatureFlagAuditLog[]       @relation("FeatureFlagDefinitionAudits")
+
+  @@unique([key], map: "uq_ff_def_key")
+  @@index([kind], map: "ix_ff_def_kind")
+  @@index([lifecycle], map: "ix_ff_def_lifecycle")
+  @@map("feature_flag_definitions")
+}
+
+/// @scope PLATFORM_ONLY
+/// @audit category=general
+model FeatureFlagPlanMap {
+  id String @id @default(uuid()) @db.Char(36)
+
+  // Plan reference is opaque until Sprint 7 introduces the `plans` table.
+  // Today the SaaS plan id is supplied by the caller and stored verbatim.
+  planId String  @map("plan_id") @db.Char(36)
+  flagId String  @map("flag_id") @db.Char(36)
+  value  Boolean
+
+  // Optional quota (for ENTITLEMENT kind flags), e.g. "students up to 1000".
+  quotaInt    Int?    @map("quota_int")
+  quotaWindow String? @map("quota_window") @db.VarChar(20) // 'monthly'|'yearly'|null
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  flag FeatureFlagDefinition @relation("FeatureFlagDefinitionPlans", fields: [flagId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_ff_plan_map_flag")
+
+  @@unique([planId, flagId], map: "uq_ff_plan_map")
+  @@index([flagId], map: "ix_ff_plan_map_flag")
+  @@map("feature_flag_plan_map")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model FeatureFlagTenantOverride {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  flagId String  @map("flag_id") @db.Char(36)
+  value  Boolean
+
+  quotaInt  Int?      @map("quota_int")
+  reason    String?   @db.VarChar(255)
+  setBy     String?   @map("set_by") @db.Char(36)
+  setAt     DateTime  @default(now()) @map("set_at") @db.Timestamp(3)
+  // Null = permanent override. Unique-while-active enforced via STORED
+  // generated column `expires_at_key` added by the migration:
+  //   COALESCE(DATE_FORMAT(expires_at,'%Y%m%d%H%i%s'),'NONE')
+  expiresAt DateTime? @map("expires_at") @db.Timestamp(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  flag   FeatureFlagDefinition @relation("FeatureFlagDefinitionTenants", fields: [flagId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_ff_tenant_override_flag")
+  school School                @relation("SchoolFeatureFlagOverrides", fields: [schoolId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_ff_tenant_override_school")
+
+  @@id([schoolId, id])
+  @@index([schoolId, flagId], map: "ix_ff_tenant_override_school_flag")
+  @@index([flagId], map: "ix_ff_tenant_override_flag")
+  @@map("feature_flag_tenant_overrides")
+}
+
+/// @scope PLATFORM_ONLY
+/// @audit category=general
+model FeatureFlagRollout {
+  id String @id @default(uuid()) @db.Char(36)
+
+  flagId   String          @map("flag_id") @db.Char(36)
+  strategy RolloutStrategy
+
+  // Required when strategy=PERCENTAGE. 0..100. Hash bucket on (schoolId,
+  // flagKey) decides matching at evaluation time.
+  percentage    Int?  @map("percentage")
+  // Required when strategy=TENANT_LIST.
+  tenantIdsJson Json? @map("tenant_ids_json")
+  // Required when strategy=PLAN_LIST.
+  planIdsJson   Json? @map("plan_ids_json")
+  // Required when strategy=REGION_LIST.
+  regionsJson   Json? @map("regions_json")
+
+  isActive Boolean   @default(true) @map("is_active")
+  startsAt DateTime? @map("starts_at") @db.Timestamp(3)
+  endsAt   DateTime? @map("ends_at") @db.Timestamp(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  flag FeatureFlagDefinition @relation("FeatureFlagDefinitionRollouts", fields: [flagId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_ff_rollout_flag")
+
+  @@index([flagId, isActive], map: "ix_ff_rollout_flag")
+  @@index([strategy, isActive], map: "ix_ff_rollout_strategy")
+  @@map("feature_flag_rollouts")
+}
+
+/// @scope TENANT_SHARED_PLATFORM
+model FeatureFlagAuditLog {
+  id       String  @id @default(uuid()) @db.Char(36)
+  schoolId String? @map("school_id") @db.Char(36)
+
+  flagId String @map("flag_id") @db.Char(36)
+  // 'definition'|'plan_map'|'tenant_override'|'rollout'.
+  scope  String @db.VarChar(20)
+
+  beforeValue Json?   @map("before_value")
+  afterValue  Json?   @map("after_value")
+  actorUserId String? @map("actor_user_id") @db.Char(36)
+  reason      String? @db.VarChar(255)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+
+  flag FeatureFlagDefinition @relation("FeatureFlagDefinitionAudits", fields: [flagId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "fk_ff_audit_flag")
+
+  @@index([flagId, createdAt(sort: Desc)], map: "ix_ff_audit_flag_created")
+  @@index([schoolId, createdAt(sort: Desc)], map: "ix_ff_audit_school_created")
+  @@index([scope, createdAt(sort: Desc)], map: "ix_ff_audit_scope_created")
+  @@map("feature_flag_audit")
+}

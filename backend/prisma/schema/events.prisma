@@ -1,0 +1,453 @@
+// ---------------------------------------------------------------------------
+// events.prisma — Sprint 11 Events & Activities Foundation.
+//
+// 6 models, all TENANT_OWNED with composite (school_id, id) PKs:
+//   - Event                  — header + lifecycle (DRAFT → SCHEDULED →
+//                              PUBLISHED → ONGOING → COMPLETED;
+//                              CANCELLED from any non-terminal). Auto-coded
+//                              EVT-<seq> via SEQ_NAMES.EVENT (non-FY).
+//                              Inline 3-field budget block (estimated/actual/
+//                              sponsorship) — separate budget table not
+//                              warranted for v1.
+//                              Soft-delete + active-uniqueness via STORED on
+//                              (school_id, code).
+//   - EventParticipant       — single table keyed by audience enum (STUDENT /
+//                              STAFF / TEACHER). Snapshot of class/section
+//                              taken at registration. Soft-delete + active-
+//                              uniqueness via STORED on
+//                              (school_id, event_id, user_id).
+//   - EventAttendance        — APPEND_ONLY per-participant ledger. Reserved
+//                              `method` enum (MANUAL | QR | RFID) — only
+//                              MANUAL is writeable in v1. Latest-row-wins
+//                              aggregation for current status.
+//   - EventDocument          — first real consumer of FileAsset from a
+//                              domain table (admission/staff use opaque
+//                              storageUrl). FK is single-column on
+//                              `file_asset_id` because FileAsset has a
+//                              single-column PK and is TENANT_SHARED_PLATFORM
+//                              (school_id nullable for platform assets).
+//                              Cross-tenant safety enforced in service via
+//                              assertTenantRefs.
+//   - EventFeeAssignment     — bridge row between Event participant and
+//                              Sprint 9 FeeInvoice. Created at paid-event
+//                              registration (status=PENDING); admin-triggered
+//                              batch endpoint generates invoices and stamps
+//                              `fee_invoice_id` + status=INVOICED. Sprint 11
+//                              does NOT auto-call FeeInvoiceService.generate
+//                              at registration time. Soft-delete + active-
+//                              uniqueness via STORED on
+//                              (school_id, event_id, participant_id).
+//   - EventResult            — per-participant rank/position/score/remark.
+//                              No certificate generation in v1.
+//
+// MODEL_INVENTORY §13 deviation (Sprint 11 adopts 6 of 8 listed tables):
+//   - event_categories       → code-side enum (mirrors notification category
+//                              pattern). Per-tenant custom categories use
+//                              eventType=CUSTOM + free-form subType string.
+//   - event_budgets          → inlined onto `events` as 3 columns
+//                              (estimatedCost/actualCost/sponsorshipAmount);
+//                              a 3-field budget block does not earn its own
+//                              table.
+//
+// Hand-edits required in migration.sql (Prisma can't emit STORED columns):
+//   - events.deleted_at_key                + uq_event_code_active
+//                                            (school_id, code, deleted_at_key)
+//   - event_participants.deleted_at_key    + uq_event_participant_user_active
+//                                            (school_id, event_id, user_id,
+//                                             deleted_at_key)
+//   - event_fee_assignments.deleted_at_key + uq_event_fee_assignment_active
+//                                            (school_id, event_id,
+//                                             participant_id, deleted_at_key)
+//
+// Cross-sprint reuse:
+//   - Sprint 5 file-storage: EventDocument FK → FileAsset (new
+//                            FilePurpose.EVENT_DOCUMENT registered).
+//   - Sprint 9 fees:         EventFeeAssignment.fee_invoice_id points to
+//                            FeeInvoice; invoice generation is a manual
+//                            admin batch endpoint.
+//   - Sprint 10 notifications: 6 event-key catalog entries registered at
+//                            boot; EventService dispatches at lifecycle
+//                            transitions AFTER business tx commits
+//                            (dispatcher opens its own tx).
+//   - Sprint 5 sequences:    SEQ_NAMES.EVENT (non-FY) — EVT-<seq>.
+// ---------------------------------------------------------------------------
+
+enum EventType {
+  ACADEMIC
+  CULTURAL
+  SPORTS
+  NATIONAL
+  SCHOOL_FUNCTION
+  WORKSHOP
+  SEMINAR
+  COMPETITION
+  EDUCATIONAL_TOUR
+  PICNIC
+  CUSTOM
+}
+
+enum EventCategory {
+  ACADEMIC
+  CULTURAL
+  SPORTS
+  NATIONAL
+  ADMINISTRATIVE
+  EDUCATIONAL_TOUR
+  COMPETITION
+  WORKSHOP
+  SEMINAR
+  CUSTOM
+}
+
+enum EventStatus {
+  DRAFT
+  SCHEDULED
+  PUBLISHED
+  ONGOING
+  COMPLETED
+  CANCELLED
+}
+
+enum EventRegistrationType {
+  OPEN
+  APPROVAL_REQUIRED
+  INVITATION_ONLY
+}
+
+enum EventParticipantAudience {
+  STUDENT
+  STAFF
+  TEACHER
+}
+
+enum EventParticipantStatus {
+  PENDING
+  REGISTERED
+  INVITED
+  REJECTED
+  CANCELLED
+}
+
+enum EventAttendanceStatus {
+  REGISTERED
+  ATTENDED
+  ABSENT
+  CANCELLED
+}
+
+enum EventAttendanceMethod {
+  MANUAL
+  QR
+  RFID
+}
+
+enum EventDocumentType {
+  CIRCULAR
+  GUIDELINE
+  PERMISSION_FORM
+  IMAGE
+  ATTACHMENT
+}
+
+enum EventFeeAssignmentStatus {
+  PENDING
+  INVOICED
+  VOID
+}
+
+enum EventResultPosition {
+  WINNER
+  RUNNER_UP
+  THIRD
+  PARTICIPANT
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_event_code_active partial unique
+/// are added in migration.sql (Prisma can't emit GENERATED ALWAYS AS).
+model Event {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Auto-coded EVT-<seq> via TenantSequences (SEQ_NAMES.EVENT, non-FY).
+  code        String  @db.VarChar(40)
+  name        String  @db.VarChar(200)
+  description String? @db.Text
+
+  eventType EventType     @map("event_type")
+  category  EventCategory
+  // Free-form sub-category when eventType=CUSTOM (or any further
+  // discriminator schools want — e.g., "Inter-school", "House League").
+  subType   String?       @map("sub_type") @db.VarChar(80)
+  status    EventStatus   @default(DRAFT)
+
+  startDate DateTime  @map("start_date") @db.Date
+  endDate   DateTime  @map("end_date") @db.Date
+  startTime DateTime? @map("start_time") @db.Time(0)
+  endTime   DateTime? @map("end_time") @db.Time(0)
+  timezone  String    @default("Asia/Kolkata") @db.VarChar(40)
+
+  branchId         String? @map("branch_id") @db.Char(36)
+  venue            String? @db.VarChar(200)
+  organizerStaffId String? @map("organizer_staff_id") @db.Char(36)
+
+  registrationType     EventRegistrationType @default(OPEN) @map("registration_type")
+  registrationOpen     Boolean               @default(false) @map("registration_open")
+  registrationOpenAt   DateTime?             @map("registration_open_at") @db.Timestamp(3)
+  registrationClosedAt DateTime?             @map("registration_closed_at") @db.Timestamp(3)
+  registrationCapacity Int?                  @map("registration_capacity")
+
+  // Free vs paid is a per-event flag. If isFree=false then feeHeadId is
+  // required (enforced at DTO + service layers).
+  isFree         Boolean  @default(true) @map("is_free")
+  feeHeadId      String?  @map("fee_head_id") @db.Char(36)
+  feeStructureId String?  @map("fee_structure_id") @db.Char(36)
+  feeAmount      Decimal? @map("fee_amount") @db.Decimal(12, 2)
+
+  // Inline budget block — separate EventBudget table not warranted for 3
+  // fields. Read-only metadata; no accounting integration in v1.
+  estimatedCost     Decimal? @map("estimated_cost") @db.Decimal(12, 2)
+  actualCost        Decimal? @map("actual_cost") @db.Decimal(12, 2)
+  sponsorshipAmount Decimal? @map("sponsorship_amount") @db.Decimal(12, 2)
+
+  publishedAt        DateTime? @map("published_at") @db.Timestamp(3)
+  startedAt          DateTime? @map("started_at") @db.Timestamp(3)
+  completedAt        DateTime? @map("completed_at") @db.Timestamp(3)
+  cancelledAt        DateTime? @map("cancelled_at") @db.Timestamp(3)
+  cancellationReason String?   @map("cancellation_reason") @db.VarChar(500)
+
+  // Denormalized counters — maintained inside the registration/attendance
+  // transactions with optimistic version guards.
+  registeredCount Int @default(0) @map("registered_count")
+  attendedCount   Int @default(0) @map("attended_count")
+  absentCount     Int @default(0) @map("absent_count")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  participants   EventParticipant[]   @relation("EventParticipants")
+  attendances    EventAttendance[]    @relation("EventAttendances")
+  documents      EventDocument[]      @relation("EventDocuments")
+  feeAssignments EventFeeAssignment[] @relation("EventFeeAssignments")
+  results        EventResult[]        @relation("EventResults")
+
+  @@id([schoolId, id])
+  @@index([schoolId, status, startDate], map: "ix_event_school_status_start")
+  @@index([schoolId, eventType, category], map: "ix_event_school_type_category")
+  @@index([schoolId, branchId, startDate], map: "ix_event_school_branch_start")
+  @@index([schoolId, organizerStaffId], map: "ix_event_school_organizer")
+  @@index([schoolId, deletedAt], map: "ix_event_deleted_at")
+  @@map("events")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_event_participant_user_active
+/// partial unique are added in migration.sql.
+model EventParticipant {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  eventId String @map("event_id") @db.Char(36)
+
+  audience  EventParticipantAudience
+  // userId is the canonical principal id (User.id). studentId / staffId are
+  // optional convenience pointers for FK joins when audience matches.
+  userId    String                   @map("user_id") @db.Char(36)
+  studentId String?                  @map("student_id") @db.Char(36)
+  staffId   String?                  @map("staff_id") @db.Char(36)
+
+  // Snapshot of org-unit context at registration time. Useful when the
+  // student moves class/section later (we keep the registration's original
+  // class/section for roster reporting).
+  classId   String? @map("class_id") @db.Char(36)
+  sectionId String? @map("section_id") @db.Char(36)
+
+  status           EventParticipantStatus @default(PENDING)
+  registrationType EventRegistrationType  @map("registration_type")
+
+  registeredAt       DateTime  @default(now()) @map("registered_at") @db.Timestamp(3)
+  approvedAt         DateTime? @map("approved_at") @db.Timestamp(3)
+  approvedBy         String?   @map("approved_by") @db.Char(36)
+  rejectedAt         DateTime? @map("rejected_at") @db.Timestamp(3)
+  rejectedBy         String?   @map("rejected_by") @db.Char(36)
+  rejectionReason    String?   @map("rejection_reason") @db.VarChar(500)
+  cancelledAt        DateTime? @map("cancelled_at") @db.Timestamp(3)
+  cancellationReason String?   @map("cancellation_reason") @db.VarChar(500)
+
+  // Where the registration came from: INDIVIDUAL / BULK_CLASS / BULK_SECTION /
+  // INVITATION / IMPORT. Kept as varchar to avoid an enum churn for tracking.
+  registrationSource String @map("registration_source") @db.VarChar(40)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  event          Event                @relation("EventParticipants", fields: [schoolId, eventId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_event_participant_event")
+  attendances    EventAttendance[]    @relation("EventParticipantAttendances")
+  feeAssignments EventFeeAssignment[] @relation("EventParticipantFeeAssignments")
+  results        EventResult[]        @relation("EventParticipantResults")
+
+  @@id([schoolId, id])
+  @@index([schoolId, eventId, audience, status], map: "ix_event_participant_school_event_audience_status")
+  @@index([schoolId, eventId, userId], map: "ix_event_participant_school_event_user")
+  @@index([schoolId, userId], map: "ix_event_participant_school_user")
+  @@index([schoolId, deletedAt], map: "ix_event_participant_deleted_at")
+  @@map("event_participants")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model EventAttendance {
+  // APPEND_ONLY ledger. Each mark inserts a new row; service derives the
+  // current status per participant via latest-row-wins aggregation.
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  eventId       String @map("event_id") @db.Char(36)
+  participantId String @map("participant_id") @db.Char(36)
+
+  status     EventAttendanceStatus
+  method     EventAttendanceMethod @default(MANUAL)
+  occurredAt DateTime              @default(now()) @map("occurred_at") @db.Timestamp(3)
+  markedBy   String?               @map("marked_by") @db.Char(36)
+  // Reserved for future QR / RFID scanner integrations — opaque device ref.
+  deviceRef  String?               @map("device_ref") @db.VarChar(80)
+  notes      String?               @db.VarChar(500)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+
+  event       Event            @relation("EventAttendances", fields: [schoolId, eventId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_event_attendance_event")
+  participant EventParticipant @relation("EventParticipantAttendances", fields: [schoolId, participantId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_event_attendance_participant")
+
+  @@id([schoolId, id])
+  @@index([schoolId, eventId, participantId, occurredAt], map: "ix_event_attendance_school_event_participant_occurred")
+  @@index([schoolId, eventId, status], map: "ix_event_attendance_school_event_status")
+  @@index([schoolId, participantId], map: "ix_event_attendance_school_participant")
+  @@map("event_attendance")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// FK on file_asset_id is single-column (FileAsset has a single-column PK and
+/// is TENANT_SHARED_PLATFORM with nullable school_id). Cross-tenant safety
+/// is enforced in the service layer via assertTenantRefs.
+model EventDocument {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  eventId     String @map("event_id") @db.Char(36)
+  fileAssetId String @map("file_asset_id") @db.Char(36)
+
+  documentType EventDocumentType @map("document_type")
+  title        String            @db.VarChar(200)
+  description  String?           @db.Text
+  isPublic     Boolean           @default(false) @map("is_public")
+  uploadedBy   String?           @map("uploaded_by") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  event Event @relation("EventDocuments", fields: [schoolId, eventId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_event_document_event")
+
+  @@id([schoolId, id])
+  @@index([schoolId, eventId, documentType], map: "ix_event_document_school_event_type")
+  @@index([schoolId, fileAssetId], map: "ix_event_document_school_file_asset")
+  @@index([schoolId, deletedAt], map: "ix_event_document_deleted_at")
+  @@map("event_documents")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_event_fee_assignment_active partial
+/// unique are added in migration.sql (one active assignment per
+/// event × participant).
+model EventFeeAssignment {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  eventId       String @map("event_id") @db.Char(36)
+  participantId String @map("participant_id") @db.Char(36)
+  studentId     String @map("student_id") @db.Char(36)
+
+  feeHeadId      String  @map("fee_head_id") @db.Char(36)
+  feeStructureId String? @map("fee_structure_id") @db.Char(36)
+  amount         Decimal @db.Decimal(12, 2)
+
+  status       EventFeeAssignmentStatus @default(PENDING)
+  // Stamped by the manual generate-invoices batch endpoint. Null until the
+  // admin triggers invoice generation for this assignment.
+  feeInvoiceId String?                  @map("fee_invoice_id") @db.Char(36)
+  invoicedAt   DateTime?                @map("invoiced_at") @db.Timestamp(3)
+  voidedAt     DateTime?                @map("voided_at") @db.Timestamp(3)
+  voidedBy     String?                  @map("voided_by") @db.Char(36)
+  voidReason   String?                  @map("void_reason") @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  event       Event            @relation("EventFeeAssignments", fields: [schoolId, eventId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_event_fee_assignment_event")
+  participant EventParticipant @relation("EventParticipantFeeAssignments", fields: [schoolId, participantId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_event_fee_assignment_participant")
+
+  @@id([schoolId, id])
+  @@index([schoolId, eventId, status], map: "ix_event_fee_assignment_school_event_status")
+  @@index([schoolId, participantId], map: "ix_event_fee_assignment_school_participant")
+  @@index([schoolId, feeInvoiceId], map: "ix_event_fee_assignment_school_invoice")
+  @@index([schoolId, deletedAt], map: "ix_event_fee_assignment_deleted_at")
+  @@map("event_fee_assignments")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model EventResult {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  eventId       String @map("event_id") @db.Char(36)
+  participantId String @map("participant_id") @db.Char(36)
+
+  rank      Int?
+  position  EventResultPosition @default(PARTICIPANT)
+  score     Decimal?            @db.Decimal(10, 2)
+  remark    String?             @db.VarChar(500)
+  awardedAt DateTime?           @map("awarded_at") @db.Timestamp(3)
+  awardedBy String?             @map("awarded_by") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  event       Event            @relation("EventResults", fields: [schoolId, eventId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_event_result_event")
+  participant EventParticipant @relation("EventParticipantResults", fields: [schoolId, participantId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_event_result_participant")
+
+  @@id([schoolId, id])
+  @@index([schoolId, eventId, position], map: "ix_event_result_school_event_position")
+  @@index([schoolId, participantId], map: "ix_event_result_school_participant")
+  @@index([schoolId, deletedAt], map: "ix_event_result_deleted_at")
+  @@map("event_results")
+}

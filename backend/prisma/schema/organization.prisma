@@ -1,0 +1,112 @@
+// ---------------------------------------------------------------------------
+// organization.prisma — Organisational structure (Sprint 4.5).
+//
+// Today `staff.designation` is a free-form VARCHAR(100). HOD reports,
+// payroll grades, reporting hierarchies, and school-org charts all need
+// real entities. This sprint adds two lookup-style tables:
+//
+//   - `Department`   — academic / admin / support / finance / HR / IT.
+//                      Optionally bound to a branch (or null = school-wide),
+//                      optionally has a parent department (sub-departments),
+//                      optionally has a head Staff member.
+//   - `Designation`  — job titles ("Principal", "Vice Principal", "TGT").
+//                      Carries a 1..100 rank for sorting; flags for teaching
+//                      vs management roles. Optional self-ref `reportsTo`
+//                      builds a hierarchy.
+//
+// Both are TENANT_OWNED with composite PKs and user-supplied codes.
+// `staff.designation` (the VARCHAR) stays alongside `staff.designationId`
+// for now — backfill is a Sprint 7 concern.
+// ---------------------------------------------------------------------------
+
+enum DepartmentType {
+  ACADEMIC
+  ADMIN
+  SUPPORT
+  FINANCE
+  HR
+  IT
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model Department {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Null = school-wide department (e.g. "Finance" with one office across all
+  // branches). Non-null = branch-scoped (e.g. "North Wing Reception").
+  branchId           String? @map("branch_id") @db.Char(36)
+  // Optional self-ref — sub-departments under a parent (e.g. "Mathematics"
+  // under "Academic"). Service enforces single-school scope.
+  parentDepartmentId String? @map("parent_department_id") @db.Char(36)
+
+  code        String         @db.VarChar(40)
+  name        String         @db.VarChar(120)
+  type        DepartmentType
+  description String?        @db.VarChar(500)
+  // Optional head — a Staff row. SetNull if the staff member leaves; the
+  // department survives.
+  headStaffId String?        @map("head_staff_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  branch   Branch?      @relation("BranchDepartments", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_department_branch")
+  parent   Department?  @relation("DepartmentHierarchy", fields: [schoolId, parentDepartmentId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_department_parent")
+  children Department[] @relation("DepartmentHierarchy")
+  head     Staff?       @relation("StaffHeadedDepartments", fields: [schoolId, headStaffId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_department_head")
+  staff    Staff[]      @relation("StaffDepartment")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, code], map: "uq_department_school_code")
+  @@index([schoolId, branchId], map: "ix_department_school_branch")
+  @@index([schoolId, parentDepartmentId], map: "ix_department_school_parent")
+  @@index([schoolId, type], map: "ix_department_school_type")
+  @@map("departments")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model Designation {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  code                   String  @db.VarChar(40)
+  name                   String  @db.VarChar(120)
+  // 1 = highest authority (e.g. "Chairman"); 100 = lowest. Service validates
+  // 1..100. Used for sorting designation pickers and report-card headers.
+  rank                   Int
+  // Teaching designations get the teacher-picker affordance on timetable /
+  // exam screens (Sprint 11/12).
+  isTeaching             Boolean @default(false) @map("is_teaching")
+  // Management designations gate access to certain reports (Sprint 7+).
+  isManagement           Boolean @default(false) @map("is_management")
+  description            String? @db.VarChar(500)
+  // Optional self-ref to model the reporting hierarchy ("TGT" reports to
+  // "HOD"). Service enforces single-school scope.
+  reportsToDesignationId String? @map("reports_to_designation_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  reportsTo Designation?  @relation("DesignationHierarchy", fields: [schoolId, reportsToDesignationId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_designation_reports_to")
+  reports   Designation[] @relation("DesignationHierarchy")
+  staff     Staff[]       @relation("StaffDesignation")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, code], map: "uq_designation_school_code")
+  @@index([schoolId, rank], map: "ix_designation_school_rank")
+  @@index([schoolId, isTeaching], map: "ix_designation_school_teaching")
+  @@map("designations")
+}

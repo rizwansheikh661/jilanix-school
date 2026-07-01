@@ -1,0 +1,243 @@
+// ---------------------------------------------------------------------------
+// platform.prisma — Platform / Tenancy domain.
+//
+// Sprint 1 scope: the absolute minimum needed to bring up a Prisma client
+// and seed a canary tenant. Identity (users, sessions, OTPs) and RBAC
+// (roles, permissions) live in their own files and are introduced in the
+// Auth sprint, not this one.
+//
+// Naming note: the strategy doc and the design doc disagree on whether the
+// root tenant entity is called `tenants` or `schools`. We adopt
+// DATABASE_DESIGN.md's `schools` because that's the canonical column-level
+// contract; the application-side type alias `Tenant = School` is set up in
+// `src/contracts/` when we wire that file out.
+// ---------------------------------------------------------------------------
+
+/// Sprint 14 — typed lifecycle enum for `schools.lifecycle_status`. Carried
+/// alongside the legacy free-form `status` VARCHAR(20) so the Super Admin
+/// provisioning paths can branch deterministically.
+enum SchoolLifecycleStatus {
+  TRIAL
+  ACTIVE
+  SUSPENDED
+  EXPIRED
+  CANCELLED
+}
+
+/// Sprint 14 — typed plan-assignment status. NULL when the school has never
+/// been assigned a plan; populated once a plan is bound.
+enum PlanStatus {
+  ACTIVE
+  ASSIGNED
+  EXPIRED
+  CANCELLED
+}
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=tenancy
+model School {
+  id            String  @id @default(uuid()) @db.Char(36)
+  slug          String  @db.VarChar(100)
+  legalName     String  @map("legal_name") @db.VarChar(255)
+  displayName   String  @map("display_name") @db.VarChar(255)
+  countryCode   String  @default("IN") @map("country_code") @db.Char(2)
+  gstin         String? @db.VarChar(15)
+  pan           String? @db.VarChar(10)
+  addressLine1  String? @map("address_line1") @db.VarChar(255)
+  addressLine2  String? @map("address_line2") @db.VarChar(255)
+  city          String? @db.VarChar(100)
+  stateCode     String? @map("state_code") @db.VarChar(10)
+  pincode       String? @db.VarChar(10)
+  phone         String? @db.VarChar(20)
+  email         String? @db.VarChar(255)
+  website       String? @db.VarChar(255)
+  timezone      String  @default("Asia/Kolkata") @db.VarChar(64)
+  localeDefault String  @default("en-IN") @map("locale_default") @db.VarChar(16)
+
+  // Lifecycle. Legacy `status` is kept for backward compatibility and the
+  // existing `status, createdAt` index. The Sprint 14 typed lifecycle lives
+  // in `lifecycleStatus` (`SchoolLifecycleStatus` enum) and is the source of
+  // truth for the new provisioning paths.
+  status      String    @default("trial") @db.VarChar(20)
+  onboardedAt DateTime? @map("onboarded_at") @db.Timestamp(3)
+  archivedAt  DateTime? @map("archived_at") @db.Timestamp(3)
+
+  // Sprint 14 — Super Admin & School Provisioning Foundation.
+  lifecycleStatus    SchoolLifecycleStatus @default(TRIAL) @map("lifecycle_status")
+  trialStartDate     DateTime?             @map("trial_start_date") @db.Timestamp(3)
+  trialEndDate       DateTime?             @map("trial_end_date") @db.Timestamp(3)
+  trialExtendedCount Int                   @default(0) @map("trial_extended_count")
+  planId             String?               @map("plan_id") @db.Char(36)
+  planAssignedAt     DateTime?             @map("plan_assigned_at") @db.Timestamp(3)
+  planExpiresAt      DateTime?             @map("plan_expires_at") @db.Timestamp(3)
+  planStatus         PlanStatus?           @map("plan_status")
+  suspendedAt        DateTime?             @map("suspended_at") @db.Timestamp(3)
+  suspendedReason    String?               @map("suspended_reason") @db.VarChar(500)
+  cancelledAt        DateTime?             @map("cancelled_at") @db.Timestamp(3)
+
+  // Audit columns — present on every table per strategy. `createdBy` /
+  // `updatedBy` reference users(id) but without an FK to avoid cross-domain
+  // cycles (the audit module reconciles integrity asynchronously).
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  settings             SchoolSettings?
+  profile              SchoolProfile?              @relation("SchoolProfileSchool")
+  branding             SchoolBranding?             @relation("SchoolBrandingSchool")
+  contacts             SchoolContactInformation[]  @relation("SchoolContactSchool")
+  documents            SchoolDocument[]            @relation("SchoolDocumentSchool")
+  fileAssets           FileAsset[]                 @relation("SchoolFileAssets")
+  featureFlagOverrides FeatureFlagTenantOverride[] @relation("SchoolFeatureFlagOverrides")
+  jobDefinitions       JobDefinition[]             @relation("SchoolJobDefinitions")
+  plan                 Plan?                       @relation("SchoolPlan", fields: [planId], references: [id], onDelete: SetNull, onUpdate: Restrict, map: "fk_schools_plan")
+
+  @@unique([slug], map: "uq_schools_slug")
+  @@index([status, createdAt], map: "ix_schools_status_created_at")
+  @@index([gstin], map: "ix_schools_gstin")
+  @@index([deletedAt], map: "ix_schools_deleted_at")
+  @@index([lifecycleStatus, trialEndDate], map: "ix_schools_lifecycle_trial_end")
+  @@index([planId], map: "ix_schools_plan_id")
+  @@map("schools")
+}
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=tenancy
+///
+/// Sprint 14 — Plan catalog. Drives default trial length and channel-level
+/// communication caps for any school the plan is assigned to. Soft-delete
+/// guards against losing history when a plan is retired.
+model Plan {
+  id               String  @id @default(uuid()) @db.Char(36)
+  code             String  @db.VarChar(40)
+  name             String  @db.VarChar(120)
+  description      String? @db.VarChar(1000)
+  defaultTrialDays Int     @default(30) @map("default_trial_days")
+
+  // Channel defaults — controls which channels a freshly-provisioned school
+  // can use without an explicit override.
+  emailEnabled Boolean @default(true) @map("email_enabled")
+  smsEnabled   Boolean @default(false) @map("sms_enabled")
+  pushEnabled  Boolean @default(true) @map("push_enabled")
+  inAppEnabled Boolean @default(true) @map("in_app_enabled")
+
+  // Monthly channel limits (0 = unlimited). Surfaced into the
+  // `school_communication_entitlements` quota on plan assignment.
+  emailMonthlyLimit Int @default(0) @map("email_monthly_limit")
+  smsMonthlyLimit   Int @default(0) @map("sms_monthly_limit")
+  pushMonthlyLimit  Int @default(0) @map("push_monthly_limit")
+  inAppMonthlyLimit Int @default(0) @map("in_app_monthly_limit")
+
+  // Sprint 15 — pricing + catalog metadata. `trialDays` deprecates
+  // `defaultTrialDays` (the older column is kept populated for backcompat
+  // until Sprint 16 retires it). `isActive` gates whether the plan is
+  // visible to the super-admin assignment UI; soft-delete remains the
+  // archival channel. `sortOrder` drives presentation order.
+  monthlyPrice Decimal @default(0) @map("monthly_price") @db.Decimal(12, 2)
+  yearlyPrice  Decimal @default(0) @map("yearly_price") @db.Decimal(12, 2)
+  currency     String  @default("INR") @db.Char(3)
+  trialDays    Int     @default(30) @map("trial_days")
+  isActive     Boolean @default(true) @map("is_active")
+  sortOrder    Int     @default(0) @map("sort_order")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  schools       School[]       @relation("SchoolPlan")
+  planFeatures  PlanFeature[]  @relation("PlanPlanFeatures")
+  subscriptions Subscription[] @relation("PlanSubscriptions")
+
+  @@unique([code], map: "uq_plans_code")
+  @@index([deletedAt], map: "ix_plans_deleted_at")
+  @@index([isActive, sortOrder], map: "ix_plans_active_sort")
+  @@map("plans")
+}
+
+/// @scope CROSS_TENANT_OPERATIONAL
+/// @audit immutable
+///
+/// Sprint 14 — append-only journal of school-provisioning runs orchestrated
+/// by the platform admin. No school_id-in-PK because the row represents the
+/// provisioner output, not a tenant-owned record; the `schoolId` column is
+/// the schoolId the run targeted (NULL while the school is still being
+/// created in step 1).
+model SchoolProvisioningRun {
+  id                String    @id @default(uuid()) @db.Char(36)
+  schoolId          String?   @map("school_id") @db.Char(36)
+  triggeredByUserId String    @map("triggered_by_user_id") @db.Char(36)
+  startedAt         DateTime  @default(now()) @map("started_at") @db.Timestamp(3)
+  completedAt       DateTime? @map("completed_at") @db.Timestamp(3)
+  // 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'COMPENSATED'. Free-form
+  // VARCHAR to match the rest of the cross-tenant operational tables.
+  status            String    @default("PENDING") @db.VarChar(20)
+  stepsJson         Json      @map("steps_json")
+  errorMessage      String?   @map("error_message") @db.VarChar(2000)
+
+  @@index([schoolId, startedAt], map: "ix_school_provisioning_run_school_started")
+  @@index([status, startedAt], map: "ix_school_provisioning_run_status_started")
+  @@map("school_provisioning_runs")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=tenancy
+model SchoolSettings {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // JSON working-days bitmap, e.g. {"mon":true,"tue":true,...}.
+  workingDaysJson Json @map("working_days_json")
+
+  attendanceWindowHours        Int       @default(24) @map("attendance_window_hours")
+  examEditWindowHours          Int       @default(48) @map("exam_edit_window_hours")
+  invoiceNumberFormat          String    @default("INV/{FY}/{SEQ}") @map("invoice_number_format") @db.VarChar(100)
+  defaultCommunicationLanguage String    @default("en-IN") @map("default_communication_language") @db.VarChar(16)
+  quietHoursStart              String?   @map("quiet_hours_start") @db.VarChar(8)
+  quietHoursEnd                String?   @map("quiet_hours_end") @db.VarChar(8)
+  privacyPolicyVersion         String?   @map("privacy_policy_version") @db.VarChar(32)
+  privacyPolicyAcceptedAt      DateTime? @map("privacy_policy_accepted_at") @db.Timestamp(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  school School @relation(fields: [schoolId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "fk_school_settings_school")
+
+  // Composite PK lets every child relation key off `(school_id, id)` for
+  // tenant integrity at the FK layer (defense layer 1).
+  @@id([schoolId, id])
+  @@unique([schoolId], map: "uq_school_settings_school_id")
+  @@index([schoolId], map: "ix_school_settings_school_id")
+  @@map("school_settings")
+}
+
+// ---------------------------------------------------------------------------
+// Reference data — small, cross-tenant lookup tables that don't fit cleanly
+// into another domain. Kept here to avoid an extra file for one or two
+// tables this early in the schema.
+// ---------------------------------------------------------------------------
+
+/// @scope PLATFORM_ONLY
+model Region {
+  code       String  @id @db.Char(2)
+  name       String  @db.VarChar(100)
+  // ISO 3166-1 alpha-2 region code. Stored separately from country to allow
+  // for future India-specific state-level reference data without a schema
+  // change (DATABASE_DESIGN.md anticipates `regions` covering both).
+  parentCode String? @map("parent_code") @db.Char(2)
+  isActive   Boolean @default(true) @map("is_active")
+
+  @@map("regions")
+}

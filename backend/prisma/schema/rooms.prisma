@@ -1,0 +1,92 @@
+// ---------------------------------------------------------------------------
+// rooms.prisma — Physical rooms & room types (Sprint 4.5).
+//
+// Two tables:
+//   - `RoomType` — lookup table. Schools seed CLASSROOM / LAB / HALL / OFFICE
+//                  by default, then add LIBRARY / MUSIC_ROOM / AUDITORIUM as
+//                  needed. Flags drive which rooms are eligible for exam
+//                  seating (Sprint 11) and timetable scheduling (Sprint 12).
+//   - `Room`     — physical rooms scoped to a branch. Name + code + capacity
+//                  + floor/block; status tracks UNDER_MAINTENANCE so booked
+//                  exams/timetables can be filtered.
+//
+// Both TENANT_OWNED with composite PKs and user-supplied codes.
+// ---------------------------------------------------------------------------
+
+enum RoomStatus {
+  ACTIVE
+  UNDER_MAINTENANCE
+  RETIRED
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model RoomType {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  code            String  @db.VarChar(40)
+  name            String  @db.VarChar(80)
+  defaultCapacity Int?    @map("default_capacity")
+  // Drives RoomService.findAllowedForExam() — rooms in non-exam types are
+  // hidden from the Sprint 11 exam-seating picker.
+  allowsExam      Boolean @default(false) @map("allows_exam")
+  // Drives RoomService.findAllowedForTimetable() — Sprint 12 timetable.
+  allowsTimetable Boolean @default(true) @map("allows_timetable")
+  description     String? @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  rooms Room[] @relation("RoomTypeRooms")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, code], map: "uq_room_type_school_code")
+  @@map("room_types")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model Room {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  branchId   String @map("branch_id") @db.Char(36)
+  roomTypeId String @map("room_type_id") @db.Char(36)
+
+  code     String     @db.VarChar(40)
+  name     String     @db.VarChar(120)
+  capacity Int
+  floor    String?    @db.VarChar(20)
+  block    String?    @db.VarChar(40)
+  status   RoomStatus @default(ACTIVE)
+  notes    String?    @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  branch           Branch           @relation("BranchRooms", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_room_branch")
+  roomType         RoomType         @relation("RoomTypeRooms", fields: [schoolId, roomTypeId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_room_type")
+  // Sprint 7 relations.
+  timetableEntries TimetableEntry[] @relation("RoomTimetableEntries")
+  // Sprint 8 relations.
+  examSchedules    ExamSchedule[]   @relation("RoomExamSchedules")
+
+  @@id([schoolId, id])
+  // Code unique within (school, branch) — two branches may both have a
+  // "B1-101".
+  @@unique([schoolId, branchId, code], map: "uq_room_school_branch_code")
+  @@index([schoolId, branchId, roomTypeId], map: "ix_room_school_branch_type")
+  @@index([schoolId, status], map: "ix_room_school_status")
+  @@map("rooms")
+}

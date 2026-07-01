@@ -1,0 +1,354 @@
+// ---------------------------------------------------------------------------
+// timetable.prisma — Sprint 7 Timetable Foundation (MVP).
+//
+// 8 models, all TENANT_OWNED with composite (school_id, id) PKs:
+//   - PeriodTemplate         — header. Per (school, branch, year, name) unique
+//                              (active) via STORED `deleted_at_key`.
+//   - PeriodTemplatePeriod   — child rows; 1-based contiguous index within
+//                              template.
+//   - TimetableVersion       — DRAFT/ACTIVE/ARCHIVED state machine. Only one
+//                              ACTIVE per (school, branch, year) enforced via
+//                              STORED `status_active_key`.
+//   - TimetableEntry         — section × day × period slot. Active uniqueness
+//                              on the slot enforced at DB layer; teacher/room
+//                              uniqueness enforced at the service layer.
+//   - TeacherLoad            — derived per (version, staff). Rebuilt on entry
+//                              mutations; active row uniqueness via STORED.
+//   - TeacherAvailability    — staff × day × period AVAILABLE/UNAVAILABLE
+//                              rows scoped by academic year.
+//   - TimetableConflict      — APPEND_ONLY ledger of conflict detection
+//                              passes.
+//   - TimetableSubstitution  — SCAFFOLD ONLY. Schema + enum + flags only;
+//                              no controller, service, or DTO this sprint.
+//
+// Hand-edits required in migration.sql (Prisma can't emit STORED columns):
+//   - period_templates.deleted_at_key            + uq_period_tpl_active
+//   - timetable_versions.status_active_key       + uq_tt_ver_active_per_year
+//   - timetable_versions.deleted_at_key          (same unique above)
+//   - timetable_entries.deleted_at_key           + uq_tt_entry_section_slot
+//   - teacher_load.deleted_at_key                + uq_teacher_load_active
+//
+// ISO day-of-week 1..7 (Mon..Sun) — matches WorkingDaysConfiguration.dayOfWeek.
+// ---------------------------------------------------------------------------
+
+enum PeriodType {
+  TEACHING
+  BREAK
+  ASSEMBLY
+  LUNCH
+  OTHER
+}
+
+enum TimetableVersionStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum TeacherAvailabilityKind {
+  AVAILABLE
+  UNAVAILABLE
+}
+
+enum TimetableConflictType {
+  TEACHER_DOUBLE_BOOKED
+  ROOM_DOUBLE_BOOKED
+  SECTION_DOUBLE_BOOKED
+  TEACHER_NOT_QUALIFIED
+  ROOM_DISALLOWED_TYPE
+  PERIOD_OUT_OF_TEMPLATE
+  NON_WORKING_DAY
+  TEACHER_UNAVAILABLE
+}
+
+// --- Substitution SCAFFOLD ONLY (no service this sprint) ---
+enum SubstitutionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+  EXECUTED
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model PeriodTemplate {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  branchId       String @map("branch_id") @db.Char(36)
+  academicYearId String @map("academic_year_id") @db.Char(36)
+
+  name        String  @db.VarChar(100)
+  description String? @db.VarChar(500)
+  // ISO 1..7 mask stored as JSON int[]; service rejects empty array.
+  daysJson    Json    @map("days_json")
+  isDefault   Boolean @default(false) @map("is_default")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  branch       Branch                 @relation("BranchPeriodTemplates", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_period_tpl_branch")
+  academicYear AcademicYear           @relation("AcademicYearPeriodTemplates", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_period_tpl_year")
+  periods      PeriodTemplatePeriod[] @relation("PeriodTemplatePeriods")
+  versions     TimetableVersion[]     @relation("PeriodTemplateVersions")
+
+  @@id([schoolId, id])
+  @@index([schoolId, branchId, academicYearId], map: "ix_period_tpl_school_branch_year")
+  @@index([schoolId, isDefault], map: "ix_period_tpl_school_default")
+  @@index([schoolId, deletedAt], map: "ix_period_tpl_deleted_at")
+  @@map("period_templates")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model PeriodTemplatePeriod {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  periodTemplateId String @map("period_template_id") @db.Char(36)
+
+  // 1-based ordinal within the template. Service enforces contiguous 1..N.
+  index     Int
+  label     String     @db.VarChar(80)
+  type      PeriodType @default(TEACHING)
+  startTime DateTime   @map("start_time") @db.Time(0)
+  endTime   DateTime   @map("end_time") @db.Time(0)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  template PeriodTemplate @relation("PeriodTemplatePeriods", fields: [schoolId, periodTemplateId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_period_tpl_period_tpl")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, periodTemplateId, index], map: "uq_period_tpl_period_template_index")
+  @@index([schoolId, periodTemplateId, type], map: "ix_period_tpl_period_tpl_type")
+  @@map("period_template_periods")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model TimetableVersion {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  branchId         String @map("branch_id") @db.Char(36)
+  academicYearId   String @map("academic_year_id") @db.Char(36)
+  periodTemplateId String @map("period_template_id") @db.Char(36)
+
+  name          String                 @db.VarChar(120)
+  status        TimetableVersionStatus @default(DRAFT)
+  effectiveFrom DateTime               @map("effective_from") @db.Date
+  effectiveTo   DateTime?              @map("effective_to") @db.Date
+  activatedAt   DateTime?              @map("activated_at") @db.Timestamp(3)
+  archivedAt    DateTime?              @map("archived_at") @db.Timestamp(3)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  branch         Branch                  @relation("BranchTimetableVersions", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_tt_ver_branch")
+  academicYear   AcademicYear            @relation("AcademicYearTimetableVersions", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_tt_ver_year")
+  periodTemplate PeriodTemplate          @relation("PeriodTemplateVersions", fields: [schoolId, periodTemplateId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_tt_ver_tpl")
+  entries        TimetableEntry[]        @relation("TimetableVersionEntries")
+  conflicts      TimetableConflict[]     @relation("TimetableVersionConflicts")
+  substitutions  TimetableSubstitution[] @relation("TimetableVersionSubstitutions")
+  teacherLoads   TeacherLoad[]           @relation("TimetableVersionTeacherLoads")
+
+  @@id([schoolId, id])
+  @@index([schoolId, branchId, academicYearId, status], map: "ix_tt_ver_school_branch_year_status")
+  @@index([schoolId, effectiveFrom], map: "ix_tt_ver_school_effective_from")
+  @@index([schoolId, deletedAt], map: "ix_tt_ver_deleted_at")
+  @@map("timetable_versions")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model TimetableEntry {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  timetableVersionId String  @map("timetable_version_id") @db.Char(36)
+  sectionId          String  @map("section_id") @db.Char(36)
+  subjectId          String  @map("subject_id") @db.Char(36)
+  staffId            String  @map("staff_id") @db.Char(36)
+  roomId             String? @map("room_id") @db.Char(36)
+
+  // ISO 1..7 (Mon..Sun).
+  dayOfWeek   Int @map("day_of_week")
+  // 1-based index into the version's period_template.
+  periodIndex Int @map("period_index")
+
+  notes String? @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  timetableVersion TimetableVersion        @relation("TimetableVersionEntries", fields: [schoolId, timetableVersionId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_tt_entry_version")
+  section          Section                 @relation("SectionTimetableEntries", fields: [schoolId, sectionId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_tt_entry_section")
+  subject          Subject                 @relation("SubjectTimetableEntries", fields: [schoolId, subjectId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_tt_entry_subject")
+  staff            Staff                   @relation("StaffTimetableEntries", fields: [schoolId, staffId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_tt_entry_staff")
+  room             Room?                   @relation("RoomTimetableEntries", fields: [schoolId, roomId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_tt_entry_room")
+  substitutions    TimetableSubstitution[] @relation("TimetableEntrySubstitutions")
+
+  @@id([schoolId, id])
+  @@index([schoolId, timetableVersionId, sectionId, dayOfWeek, periodIndex], map: "ix_tt_entry_ver_section_day_period")
+  @@index([schoolId, timetableVersionId, staffId, dayOfWeek, periodIndex], map: "ix_tt_entry_ver_staff_day_period")
+  @@index([schoolId, timetableVersionId, roomId, dayOfWeek, periodIndex], map: "ix_tt_entry_ver_room_day_period")
+  @@index([schoolId, sectionId], map: "ix_tt_entry_school_section")
+  @@index([schoolId, staffId], map: "ix_tt_entry_school_staff")
+  @@index([schoolId, deletedAt], map: "ix_tt_entry_deleted_at")
+  @@map("timetable_entries")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model TeacherLoad {
+  // Derived/cached: one active row per (version, staff). Recomputed on every
+  // entry mutation. Hand-added STORED unique enforces "one active row".
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  timetableVersionId String @map("timetable_version_id") @db.Char(36)
+  staffId            String @map("staff_id") @db.Char(36)
+
+  periodsPerWeek  Int      @default(0) @map("periods_per_week")
+  // Max contiguous TEACHING periods on any single day.
+  maxConsecutive  Int      @default(0) @map("max_consecutive")
+  // { "1": 4, "2": 5, ... } day->count.
+  dailyCountsJson Json     @map("daily_counts_json")
+  // { subjectId: periodCount, ... }
+  subjectMixJson  Json     @map("subject_mix_json")
+  computedAt      DateTime @map("computed_at") @db.Timestamp(3)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  timetableVersion TimetableVersion @relation("TimetableVersionTeacherLoads", fields: [schoolId, timetableVersionId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_teacher_load_ver")
+  staff            Staff            @relation("StaffTeacherLoads", fields: [schoolId, staffId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_teacher_load_staff")
+
+  @@id([schoolId, id])
+  @@index([schoolId, timetableVersionId], map: "ix_teacher_load_school_version")
+  @@index([schoolId, staffId], map: "ix_teacher_load_school_staff")
+  @@index([schoolId, deletedAt], map: "ix_teacher_load_deleted_at")
+  @@map("teacher_load")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model TeacherAvailability {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  staffId        String @map("staff_id") @db.Char(36)
+  academicYearId String @map("academic_year_id") @db.Char(36)
+
+  kind        TeacherAvailabilityKind
+  dayOfWeek   Int                     @map("day_of_week")
+  // Null = whole day.
+  periodIndex Int?                    @map("period_index")
+  reason      String?                 @db.VarChar(255)
+
+  effectiveFrom DateTime  @map("effective_from") @db.Date
+  effectiveTo   DateTime? @map("effective_to") @db.Date
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  staff        Staff        @relation("StaffTeacherAvailability", fields: [schoolId, staffId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_teacher_avail_staff")
+  academicYear AcademicYear @relation("AcademicYearTeacherAvailability", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_teacher_avail_year")
+
+  @@id([schoolId, id])
+  @@index([schoolId, staffId, academicYearId, dayOfWeek], map: "ix_teacher_avail_school_staff_year_dow")
+  @@index([schoolId, staffId, kind], map: "ix_teacher_avail_school_staff_kind")
+  @@index([schoolId, deletedAt], map: "ix_teacher_avail_deleted_at")
+  @@map("teacher_availability")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model TimetableConflict {
+  // APPEND_ONLY. Every detection pass writes new rows; readers reconcile.
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  timetableVersionId String                @map("timetable_version_id") @db.Char(36)
+  type               TimetableConflictType
+  // Free-form context: { sectionId, staffId, roomId?, dayOfWeek, periodIndex, ... }
+  contextJson        Json                  @map("context_json")
+  entryAId           String                @map("entry_a_id") @db.Char(36)
+  entryBId           String?               @map("entry_b_id") @db.Char(36)
+  detectedAt         DateTime              @default(now()) @map("detected_at") @db.Timestamp(3)
+  detectedBy         String?               @map("detected_by") @db.Char(36)
+
+  timetableVersion TimetableVersion @relation("TimetableVersionConflicts", fields: [schoolId, timetableVersionId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_tt_conflict_ver")
+
+  @@id([schoolId, id])
+  @@index([schoolId, timetableVersionId, detectedAt(sort: Desc)], map: "ix_tt_conflict_school_ver_detected")
+  @@index([schoolId, type, detectedAt(sort: Desc)], map: "ix_tt_conflict_school_type_detected")
+  @@map("timetable_conflicts")
+}
+
+// --- SUBSTITUTION SCAFFOLD: schema only, no service this sprint. ---
+/// @scope TENANT_OWNED
+/// @audit category=general
+model TimetableSubstitution {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  timetableVersionId String @map("timetable_version_id") @db.Char(36)
+  originalEntryId    String @map("original_entry_id") @db.Char(36)
+
+  date              DateTime           @db.Date
+  substituteStaffId String?            @map("substitute_staff_id") @db.Char(36)
+  reason            String?            @db.VarChar(500)
+  status            SubstitutionStatus @default(PENDING)
+  decidedBy         String?            @map("decided_by") @db.Char(36)
+  decidedAt         DateTime?          @map("decided_at") @db.Timestamp(3)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  timetableVersion TimetableVersion @relation("TimetableVersionSubstitutions", fields: [schoolId, timetableVersionId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_tt_sub_ver")
+  originalEntry    TimetableEntry   @relation("TimetableEntrySubstitutions", fields: [schoolId, originalEntryId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_tt_sub_entry")
+  substituteStaff  Staff?           @relation("StaffSubstitutionsCovered", fields: [schoolId, substituteStaffId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_tt_sub_substitute_staff")
+
+  @@id([schoolId, id])
+  @@index([schoolId, date, status], map: "ix_tt_sub_school_date_status")
+  @@index([schoolId, substituteStaffId, date], map: "ix_tt_sub_school_substitute_date")
+  @@index([schoolId, originalEntryId], map: "ix_tt_sub_school_original_entry")
+  @@index([schoolId, deletedAt], map: "ix_tt_sub_deleted_at")
+  @@map("timetable_substitutions")
+}

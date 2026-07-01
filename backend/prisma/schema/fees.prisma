@@ -1,0 +1,646 @@
+// ---------------------------------------------------------------------------
+// fees.prisma — Sprint 9 Fees & Payments Foundation (MVP).
+//
+// 13 models, all TENANT_OWNED with composite (school_id, id) PKs:
+//   - FeeHead              — line-item catalog (Tuition / Transport / Hostel /
+//                            Library / Examination / Event / Custom / etc).
+//                            Soft-delete + active-uniqueness via STORED on
+//                            (school_id, code).
+//   - FeeStructure         — DRAFT / PUBLISHED / ARCHIVED state machine; scoped
+//                            to an academic year + (optionally) class / section
+//                            / student. Soft-delete + active-uniqueness via
+//                            STORED on (school_id, academic_year_id, name).
+//   - FeeStructureLine     — child rows on a structure (head + amount +
+//                            frequency + due day + optional fine policy).
+//                            Replaced wholesale on parent PATCH.
+//   - FeeDiscount          — FLAT / PERCENT discount catalog. Soft-delete +
+//                            active-uniqueness via STORED on (school_id, code).
+//   - StudentFeeDiscount   — student × discount assignment (validity window +
+//                            approval). Soft-delete on unassign.
+//   - FeeLateFinePolicy    — FLAT_ONCE / FLAT_PER_DAY / PERCENT_PER_DAY with
+//                            grace + cap. Soft-delete + active-uniqueness via
+//                            STORED on (school_id, code).
+//   - FeeInvoice           — generated per (student, structure, period); status
+//                            machine DRAFT / SENT / PARTIAL / PAID / OVERDUE /
+//                            VOID / REFUNDED. Soft-delete + active-uniqueness
+//                            via STORED on invoice_no and on (student, structure,
+//                            period_from).
+//   - FeeInvoiceLine       — head + amount snapshot per invoice; isLateFine
+//                            flag distinguishes frozen-fine lines.
+//   - FeePayment           — CASH / CHEQUE / BANK_TRANSFER / UPI / ONLINE.
+//                            Soft-delete + active-uniqueness via STORED on
+//                            (gateway_code, gateway_payment_id) to dedupe
+//                            webhook double-deliveries when integrations land.
+//   - FeePaymentAllocation — APPEND_ONLY ledger splitting a payment across
+//                            invoice lines for partial-pay.
+//   - FeeReceipt           — gap-free RCP/<FY>/<seq> numbering via
+//                            TenantSequences; cancellation workflow (single
+//                            actor + reason this sprint). Soft-delete +
+//                            active-uniqueness via STORED on receipt_no.
+//   - FeeRefund            — APPEND_ONLY refund ledger linked to payment.
+//   - FeePaymentSource     — Sprint 9.1 hybrid-collection target accounts
+//                            (school QR / UPI / principal UPI / management UPI
+//                            / bank account / other). Soft-delete +
+//                            active-uniqueness via STORED on (school_id, code).
+//
+// Hand-edits required in migration.sql (Prisma can't emit STORED columns):
+//   - fee_heads.deleted_at_key             + uq_fee_head_active
+//   - fee_structures.deleted_at_key        + uq_fee_structure_active
+//   - fee_structure_lines.deleted_at_key   (no partial unique; soft-delete only)
+//   - fee_discounts.deleted_at_key         + uq_fee_discount_active
+//   - student_fee_discounts.deleted_at_key (no partial unique; soft-delete only)
+//   - fee_late_fine_policies.deleted_at_key + uq_fee_fine_policy_active
+//   - fee_invoices.deleted_at_key          + uq_fee_invoice_no_active
+//                                          + uq_fee_invoice_student_period_active
+//   - fee_invoice_lines.deleted_at_key     (no partial unique; soft-delete only)
+//   - fee_payments.deleted_at_key          + uq_fee_payment_gateway_ref
+//   - fee_receipts.deleted_at_key          + uq_fee_receipt_no_active
+//   - fee_payment_sources.deleted_at_key   + uq_fee_payment_source_active
+//                                            (school_id, code, deleted_at_key)
+//
+// Sprint 9.1 added: payment-source catalog + verification workflow +
+// UPI_MANUAL/ONLINE_GATEWAY methods + Cashfree adapter.
+// ---------------------------------------------------------------------------
+
+enum FeeHeadCategory {
+  TUITION
+  ADMISSION
+  TRANSPORT
+  HOSTEL
+  LIBRARY
+  EXAMINATION
+  EVENT
+  LATE_FINE
+  CUSTOM
+}
+
+enum FeeFrequency {
+  ONE_TIME
+  MONTHLY
+  QUARTERLY
+  HALF_YEARLY
+  ANNUAL
+  TERM
+}
+
+enum FeeStructureStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum FeeStructureAppliesTo {
+  SCHOOL
+  CLASS
+  SECTION
+  STUDENT
+}
+
+enum FeeDiscountType {
+  FLAT
+  PERCENT
+}
+
+enum FeeFinePolicyType {
+  FLAT_ONCE
+  FLAT_PER_DAY
+  PERCENT_PER_DAY
+}
+
+enum FeeInvoiceStatus {
+  DRAFT
+  SENT
+  PARTIAL
+  PAID
+  OVERDUE
+  VOID
+  REFUNDED
+}
+
+enum FeePaymentMethod {
+  CASH
+  CHEQUE
+  BANK_TRANSFER
+  UPI_MANUAL
+  ONLINE_GATEWAY
+  // Deprecated — retained for migration safety, rejected on new captures.
+  UPI
+  ONLINE
+}
+
+enum FeePaymentVerificationStatus {
+  NOT_REQUIRED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum FeePaymentSourceKind {
+  SCHOOL_QR
+  SCHOOL_UPI
+  PRINCIPAL_UPI
+  MANAGEMENT_UPI
+  SCHOOL_BANK_ACCOUNT
+  OTHER
+}
+
+enum FeePaymentStatus {
+  PENDING
+  CAPTURED
+  FAILED
+  REFUNDED
+  CANCELLED
+}
+
+enum FeeReceiptStatus {
+  ISSUED
+  CANCELLED
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=finance
+model FeeHead {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  code          String          @db.VarChar(40)
+  name          String          @db.VarChar(120)
+  category      FeeHeadCategory
+  // HSN/SAC tax-code placeholder. Sprint 9 leaves taxes at 0; column is wired
+  // so future GST work doesn't require a migration.
+  hsnSac        String?         @map("hsn_sac") @db.VarChar(20)
+  isRefundable  Boolean         @default(true) @map("is_refundable")
+  isTaxable     Boolean         @default(false) @map("is_taxable")
+  defaultAmount Decimal?        @map("default_amount") @db.Decimal(12, 2)
+  glAccount     String?         @map("gl_account") @db.VarChar(40)
+  description   String?         @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  structureLines FeeStructureLine[] @relation("FeeHeadStructureLines")
+  invoiceLines   FeeInvoiceLine[]   @relation("FeeHeadInvoiceLines")
+  discounts      FeeDiscount[]      @relation("FeeHeadDiscounts")
+
+  @@id([schoolId, id])
+  @@index([schoolId, category], map: "ix_fee_head_school_category")
+  @@index([schoolId, deletedAt], map: "ix_fee_head_deleted_at")
+  @@map("fee_heads")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=finance
+model FeeStructure {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  academicYearId String  @map("academic_year_id") @db.Char(36)
+  branchId       String? @map("branch_id") @db.Char(36)
+
+  name        String                @db.VarChar(160)
+  appliesTo   FeeStructureAppliesTo @map("applies_to")
+  classId     String?               @map("class_id") @db.Char(36)
+  sectionId   String?               @map("section_id") @db.Char(36)
+  studentId   String?               @map("student_id") @db.Char(36)
+  currency    String                @default("INR") @db.Char(3)
+  status      FeeStructureStatus    @default(DRAFT)
+  publishedAt DateTime?             @map("published_at") @db.Timestamp(3)
+  archivedAt  DateTime?             @map("archived_at") @db.Timestamp(3)
+  description String?               @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  academicYear AcademicYear @relation("AcademicYearFeeStructures", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_structure_year")
+  branch       Branch?      @relation("BranchFeeStructures", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_structure_branch")
+  class        Class?       @relation("ClassFeeStructures", fields: [schoolId, classId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_structure_class")
+  section      Section?     @relation("SectionFeeStructures", fields: [schoolId, sectionId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_structure_section")
+  student      Student?     @relation("StudentFeeStructures", fields: [schoolId, studentId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_structure_student")
+
+  lines    FeeStructureLine[] @relation("FeeStructureLines")
+  invoices FeeInvoice[]       @relation("FeeStructureInvoices")
+
+  @@id([schoolId, id])
+  @@index([schoolId, academicYearId, status], map: "ix_fee_structure_school_year_status")
+  @@index([schoolId, classId], map: "ix_fee_structure_school_class")
+  @@index([schoolId, sectionId], map: "ix_fee_structure_school_section")
+  @@index([schoolId, studentId], map: "ix_fee_structure_school_student")
+  @@index([schoolId, deletedAt], map: "ix_fee_structure_deleted_at")
+  @@map("fee_structures")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=finance
+model FeeStructureLine {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  feeStructureId   String  @map("fee_structure_id") @db.Char(36)
+  feeHeadId        String  @map("fee_head_id") @db.Char(36)
+  lateFinePolicyId String? @map("late_fine_policy_id") @db.Char(36)
+
+  amount    Decimal      @db.Decimal(12, 2)
+  frequency FeeFrequency
+  // Calendar day-of-month due date hint (1..31). Service computes actual
+  // due date per invoice from (periodFrom + dueDay).
+  dueDay    Int?         @map("due_day")
+  ordering  Int
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  structure      FeeStructure       @relation("FeeStructureLines", fields: [schoolId, feeStructureId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_fee_structure_line_structure")
+  feeHead        FeeHead            @relation("FeeHeadStructureLines", fields: [schoolId, feeHeadId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_structure_line_head")
+  lateFinePolicy FeeLateFinePolicy? @relation("FeeLateFinePolicyStructureLines", fields: [schoolId, lateFinePolicyId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_structure_line_fine_policy")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, feeStructureId, feeHeadId, ordering], map: "uq_fee_structure_line_ordering")
+  @@index([schoolId, feeStructureId], map: "ix_fee_structure_line_school_structure")
+  @@index([schoolId, feeHeadId], map: "ix_fee_structure_line_school_head")
+  @@index([schoolId, deletedAt], map: "ix_fee_structure_line_deleted_at")
+  @@map("fee_structure_lines")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=finance
+model FeeDiscount {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // When set, the discount applies only to lines for this specific head; null
+  // means "applies across all heads on an invoice".
+  appliesToFeeHeadId String? @map("applies_to_fee_head_id") @db.Char(36)
+
+  code                  String          @db.VarChar(40)
+  name                  String          @db.VarChar(120)
+  type                  FeeDiscountType
+  value                 Decimal         @db.Decimal(10, 2)
+  // Optional cap when type=PERCENT; null = uncapped.
+  maxAmount             Decimal?        @map("max_amount") @db.Decimal(12, 2)
+  description           String?         @db.VarChar(500)
+  // If an assignment's effective discount exceeds this, the assignment must
+  // be approved (`student-fee-discount.approve`) before invoice generation
+  // honors it. Null = no approval gate.
+  requiresApprovalAbove Decimal?        @map("requires_approval_above") @db.Decimal(12, 2)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  appliesToFeeHead FeeHead? @relation("FeeHeadDiscounts", fields: [schoolId, appliesToFeeHeadId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_discount_head")
+
+  studentAssignments StudentFeeDiscount[] @relation("FeeDiscountStudentAssignments")
+
+  @@id([schoolId, id])
+  @@index([schoolId, type], map: "ix_fee_discount_school_type")
+  @@index([schoolId, appliesToFeeHeadId], map: "ix_fee_discount_school_head")
+  @@index([schoolId, deletedAt], map: "ix_fee_discount_deleted_at")
+  @@map("fee_discounts")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=finance
+model StudentFeeDiscount {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  studentId      String @map("student_id") @db.Char(36)
+  feeDiscountId  String @map("fee_discount_id") @db.Char(36)
+  academicYearId String @map("academic_year_id") @db.Char(36)
+
+  validFrom  DateTime  @map("valid_from") @db.Date
+  validTo    DateTime? @map("valid_to") @db.Date
+  reason     String?   @db.VarChar(500)
+  approvedAt DateTime? @map("approved_at") @db.Timestamp(3)
+  approvedBy String?   @map("approved_by") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  student      Student      @relation("StudentFeeDiscounts", fields: [schoolId, studentId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_student_fee_discount_student")
+  feeDiscount  FeeDiscount  @relation("FeeDiscountStudentAssignments", fields: [schoolId, feeDiscountId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_student_fee_discount_discount")
+  academicYear AcademicYear @relation("AcademicYearStudentFeeDiscounts", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_student_fee_discount_year")
+
+  @@id([schoolId, id])
+  @@index([schoolId, studentId, academicYearId], map: "ix_student_fee_discount_school_student_year")
+  @@index([schoolId, feeDiscountId], map: "ix_student_fee_discount_school_discount")
+  @@index([schoolId, deletedAt], map: "ix_student_fee_discount_deleted_at")
+  @@map("student_fee_discounts")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=finance
+model FeeLateFinePolicy {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  code            String            @db.VarChar(40)
+  name            String            @db.VarChar(120)
+  type            FeeFinePolicyType
+  value           Decimal           @db.Decimal(10, 2)
+  gracePeriodDays Int               @default(0) @map("grace_period_days")
+  capAmount       Decimal?          @map("cap_amount") @db.Decimal(12, 2)
+  description     String?           @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  structureLines FeeStructureLine[] @relation("FeeLateFinePolicyStructureLines")
+
+  @@id([schoolId, id])
+  @@index([schoolId, type], map: "ix_fee_fine_policy_school_type")
+  @@index([schoolId, deletedAt], map: "ix_fee_fine_policy_deleted_at")
+  @@map("fee_late_fine_policies")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=finance
+model FeeInvoice {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  studentId      String  @map("student_id") @db.Char(36)
+  feeStructureId String  @map("fee_structure_id") @db.Char(36)
+  academicYearId String  @map("academic_year_id") @db.Char(36)
+  branchId       String? @map("branch_id") @db.Char(36)
+
+  // INV/<FY>/<seq> via TenantSequences (SEQ_NAMES.INVOICE, fiscalYear flag).
+  invoiceNo     String           @map("invoice_no") @db.VarChar(40)
+  periodFrom    DateTime         @map("period_from") @db.Date
+  periodTo      DateTime         @map("period_to") @db.Date
+  issueDate     DateTime         @map("issue_date") @db.Date
+  dueDate       DateTime         @map("due_date") @db.Date
+  subtotal      Decimal          @default(0.00) @db.Decimal(12, 2)
+  discountTotal Decimal          @default(0.00) @map("discount_total") @db.Decimal(12, 2)
+  taxTotal      Decimal          @default(0.00) @map("tax_total") @db.Decimal(12, 2)
+  total         Decimal          @default(0.00) @db.Decimal(12, 2)
+  paidTotal     Decimal          @default(0.00) @map("paid_total") @db.Decimal(12, 2)
+  refundTotal   Decimal          @default(0.00) @map("refund_total") @db.Decimal(12, 2)
+  balanceTotal  Decimal          @default(0.00) @map("balance_total") @db.Decimal(12, 2)
+  status        FeeInvoiceStatus @default(DRAFT)
+  notes         String?          @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  student      Student      @relation("StudentFeeInvoices", fields: [schoolId, studentId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_invoice_student")
+  structure    FeeStructure @relation("FeeStructureInvoices", fields: [schoolId, feeStructureId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_invoice_structure")
+  academicYear AcademicYear @relation("AcademicYearFeeInvoices", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_invoice_year")
+  branch       Branch?      @relation("BranchFeeInvoices", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_invoice_branch")
+
+  lines       FeeInvoiceLine[]       @relation("FeeInvoiceLines")
+  allocations FeePaymentAllocation[] @relation("FeeInvoiceAllocations")
+
+  @@id([schoolId, id])
+  @@index([schoolId, studentId, academicYearId], map: "ix_fee_invoice_school_student_year")
+  @@index([schoolId, status, dueDate], map: "ix_fee_invoice_school_status_due")
+  @@index([schoolId, periodFrom], map: "ix_fee_invoice_school_period")
+  @@index([schoolId, deletedAt], map: "ix_fee_invoice_deleted_at")
+  @@map("fee_invoices")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=finance
+model FeeInvoiceLine {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  feeInvoiceId       String  @map("fee_invoice_id") @db.Char(36)
+  feeHeadId          String  @map("fee_head_id") @db.Char(36)
+  // When `isLateFine=true` this points to the policy that produced the line.
+  sourceFinePolicyId String? @map("source_fine_policy_id") @db.Char(36)
+  // When this line is a discount snapshot, points back to the source discount.
+  sourceDiscountId   String? @map("source_discount_id") @db.Char(36)
+
+  description    String  @db.VarChar(255)
+  quantity       Int     @default(1)
+  unitAmount     Decimal @map("unit_amount") @db.Decimal(12, 2)
+  discountAmount Decimal @default(0.00) @map("discount_amount") @db.Decimal(12, 2)
+  taxAmount      Decimal @default(0.00) @map("tax_amount") @db.Decimal(12, 2)
+  lineTotal      Decimal @map("line_total") @db.Decimal(12, 2)
+  isLateFine     Boolean @default(false) @map("is_late_fine")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  invoice FeeInvoice @relation("FeeInvoiceLines", fields: [schoolId, feeInvoiceId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_fee_invoice_line_invoice")
+  feeHead FeeHead    @relation("FeeHeadInvoiceLines", fields: [schoolId, feeHeadId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_invoice_line_head")
+
+  @@id([schoolId, id])
+  @@index([schoolId, feeInvoiceId], map: "ix_fee_invoice_line_school_invoice")
+  @@index([schoolId, feeHeadId], map: "ix_fee_invoice_line_school_head")
+  @@index([schoolId, deletedAt], map: "ix_fee_invoice_line_deleted_at")
+  @@map("fee_invoice_lines")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=finance
+model FeePayment {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  studentId String @map("student_id") @db.Char(36)
+
+  paymentNo        String?          @map("payment_no") @db.VarChar(40)
+  method           FeePaymentMethod
+  amount           Decimal          @db.Decimal(12, 2)
+  status           FeePaymentStatus @default(CAPTURED)
+  referenceNo      String?          @map("reference_no") @db.VarChar(120)
+  paidAt           DateTime         @map("paid_at") @db.Timestamp(3)
+  gatewayCode      String?          @map("gateway_code") @db.VarChar(40)
+  gatewayPaymentId String?          @map("gateway_payment_id") @db.VarChar(120)
+  notes            String?          @db.VarChar(500)
+
+  paymentSourceId    String?                      @map("payment_source_id") @db.Char(36)
+  paymentProofUrl    String?                      @map("payment_proof_url") @db.VarChar(500)
+  verificationStatus FeePaymentVerificationStatus @default(NOT_REQUIRED) @map("verification_status")
+  verifiedBy         String?                      @map("verified_by") @db.Char(36)
+  verifiedAt         DateTime?                    @map("verified_at") @db.Timestamp(3)
+  verificationNotes  String?                      @map("verification_notes") @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  student       Student           @relation("StudentFeePayments", fields: [schoolId, studentId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_payment_student")
+  paymentSource FeePaymentSource? @relation("FeePaymentSourceLink", fields: [schoolId, paymentSourceId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_payment_source")
+
+  allocations FeePaymentAllocation[] @relation("FeePaymentAllocations")
+  receipt     FeeReceipt?            @relation("FeePaymentReceipt")
+  refunds     FeeRefund[]            @relation("FeePaymentRefunds")
+
+  @@id([schoolId, id])
+  @@index([schoolId, studentId, paidAt], map: "ix_fee_payment_school_student_paid")
+  @@index([schoolId, method, paidAt], map: "ix_fee_payment_school_method_paid")
+  @@index([schoolId, status], map: "ix_fee_payment_school_status")
+  @@index([schoolId, verificationStatus, paidAt], map: "ix_fee_payment_school_verif_paid")
+  @@index([schoolId, paymentSourceId], map: "ix_fee_payment_school_source")
+  @@index([schoolId, deletedAt], map: "ix_fee_payment_deleted_at")
+  @@map("fee_payments")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=finance
+model FeePaymentAllocation {
+  // APPEND_ONLY. Reversal on cancel/refund writes a `reversedAt` timestamp;
+  // never row-deleted.
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  feePaymentId String @map("fee_payment_id") @db.Char(36)
+  feeInvoiceId String @map("fee_invoice_id") @db.Char(36)
+
+  amount         Decimal   @db.Decimal(12, 2)
+  allocatedAt    DateTime  @default(now()) @map("allocated_at") @db.Timestamp(3)
+  allocatedBy    String?   @map("allocated_by") @db.Char(36)
+  reversedAt     DateTime? @map("reversed_at") @db.Timestamp(3)
+  reversedBy     String?   @map("reversed_by") @db.Char(36)
+  reversalReason String?   @map("reversal_reason") @db.VarChar(500)
+
+  payment FeePayment @relation("FeePaymentAllocations", fields: [schoolId, feePaymentId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_fee_payment_alloc_payment")
+  invoice FeeInvoice @relation("FeeInvoiceAllocations", fields: [schoolId, feeInvoiceId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_payment_alloc_invoice")
+
+  @@id([schoolId, id])
+  @@index([schoolId, feePaymentId], map: "ix_fee_payment_alloc_school_payment")
+  @@index([schoolId, feeInvoiceId], map: "ix_fee_payment_alloc_school_invoice")
+  @@map("fee_payment_allocations")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=finance
+model FeeReceipt {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  feePaymentId String @map("fee_payment_id") @db.Char(36)
+  studentId    String @map("student_id") @db.Char(36)
+
+  // RCP/<FY>/<seq> via TenantSequences (SEQ_NAMES.RECEIPT, fiscalYear flag).
+  receiptNo          String           @map("receipt_no") @db.VarChar(40)
+  issuedAt           DateTime         @map("issued_at") @db.Timestamp(3)
+  issuedBy           String?          @map("issued_by") @db.Char(36)
+  totalAmount        Decimal          @map("total_amount") @db.Decimal(12, 2)
+  status             FeeReceiptStatus @default(ISSUED)
+  cancelledAt        DateTime?        @map("cancelled_at") @db.Timestamp(3)
+  cancelledBy        String?          @map("cancelled_by") @db.Char(36)
+  cancellationReason String?          @map("cancellation_reason") @db.VarChar(500)
+  notes              String?          @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  // One receipt per captured payment; service writes both in the same tx.
+  payment FeePayment @relation("FeePaymentReceipt", fields: [schoolId, feePaymentId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_fee_receipt_payment")
+  student Student    @relation("StudentFeeReceipts", fields: [schoolId, studentId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_fee_receipt_student")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, feePaymentId], map: "uq_fee_receipt_payment")
+  @@index([schoolId, studentId, issuedAt], map: "ix_fee_receipt_school_student_issued")
+  @@index([schoolId, status], map: "ix_fee_receipt_school_status")
+  @@index([schoolId, deletedAt], map: "ix_fee_receipt_deleted_at")
+  @@map("fee_receipts")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=finance
+model FeeRefund {
+  // APPEND_ONLY. Reads only; partial refunds add new rows rather than mutating.
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  feePaymentId String @map("fee_payment_id") @db.Char(36)
+
+  amount      Decimal          @db.Decimal(12, 2)
+  reason      String           @db.VarChar(500)
+  refundedAt  DateTime         @default(now()) @map("refunded_at") @db.Timestamp(3)
+  refundedBy  String?          @map("refunded_by") @db.Char(36)
+  method      FeePaymentMethod
+  referenceNo String?          @map("reference_no") @db.VarChar(120)
+
+  payment FeePayment @relation("FeePaymentRefunds", fields: [schoolId, feePaymentId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_fee_refund_payment")
+
+  @@id([schoolId, id])
+  @@index([schoolId, feePaymentId, refundedAt(sort: Desc)], map: "ix_fee_refund_school_payment_refunded")
+  @@map("fee_refunds")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=finance
+model FeePaymentSource {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  code        String               @db.VarChar(40)
+  name        String               @db.VarChar(120)
+  kind        FeePaymentSourceKind
+  // UPI VPA, QR ref, or bank account number (no validation here — admin's choice).
+  identifier  String               @db.VarChar(255)
+  ifsc        String?              @db.VarChar(20)
+  holderName  String?              @map("holder_name") @db.VarChar(120)
+  isActive    Boolean              @default(true) @map("is_active")
+  description String?              @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  payments FeePayment[] @relation("FeePaymentSourceLink")
+
+  @@id([schoolId, id])
+  @@index([schoolId, kind], map: "ix_fee_payment_source_school_kind")
+  @@index([schoolId, isActive], map: "ix_fee_payment_source_school_active")
+  @@index([schoolId, deletedAt], map: "ix_fee_payment_source_deleted_at")
+  @@map("fee_payment_sources")
+}

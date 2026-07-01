@@ -1,0 +1,320 @@
+// ---------------------------------------------------------------------------
+// attendance.prisma — Attendance Foundation (Sprint 6, MVP).
+//
+// Six tables, all TENANT_OWNED with composite (school_id, id) PKs:
+//
+//   - `AttendanceDaily`         — one row per (student, date). MVP is daily
+//                                 class attendance; the `mode`, `period_number`
+//                                 and `subject_id` columns are reserved for
+//                                 period/subject-wise attendance shipping
+//                                 behind future flags.
+//   - `StaffAttendance`         — mirror of AttendanceDaily for staff. No
+//                                 academic-year/section coupling.
+//   - `AttendanceLockWindow`    — date-range lock at SCHOOL | BRANCH | SECTION
+//                                 scope. Writes inside the window must go
+//                                 through `AttendanceCorrection`.
+//   - `AttendanceCorrection`    — request → approve|reject workflow for
+//                                 edits outside the edit window OR inside a
+//                                 lock. Approval applies the new status,
+//                                 writes history, fires outbox.
+//   - `AttendanceStatusHistory` — APPEND_ONLY ledger of status changes on
+//                                 AttendanceDaily. One row per
+//                                 MARKED/EDITED/CORRECTED transition.
+//   - `AttendanceConfig`        — per-(school, branch?) tunables. Null
+//                                 branch_id = school-wide default; service
+//                                 falls back when no branch override exists.
+//
+// `branchId` on AttendanceDaily/StaffAttendance/AttendanceConfig is
+// nullable because Section/Student/Staff do not carry branchId in the
+// current schema. Service-level branch derivation will populate it from
+// request context where available; backfill is a later sprint concern.
+//
+// Soft-delete (`deletedAt`) on AttendanceDaily, StaffAttendance,
+// AttendanceLockWindow (unlock = soft-delete), and AttendanceConfig.
+// Status history is append-only; corrections are mutated in place.
+//
+// Hand-edits required in the migration (Prisma cannot emit GENERATED
+// columns on MySQL):
+//   * `attendance_daily.deleted_at_key` STORED + `uq_att_daily_active`
+//   * `staff_attendance.deleted_at_key` STORED + `uq_staff_att_active`
+//   * `attendance_config.deleted_at_key`, `branch_id_key` STORED +
+//     `uq_att_config_active`
+// ---------------------------------------------------------------------------
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  HALF_DAY
+  LEAVE
+  HOLIDAY
+}
+
+enum AttendanceSource {
+  MANUAL
+  BIOMETRIC
+  RFID
+  FACE_RECOGNITION
+  MOBILE_APP
+}
+
+enum AttendanceMode {
+  DAILY
+  PERIOD
+}
+
+enum AttendanceCorrectionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum AttendanceLockScope {
+  SCHOOL
+  BRANCH
+  SECTION
+}
+
+enum AttendanceHistoryChangeType {
+  MARKED
+  EDITED
+  CORRECTED
+  SYSTEM
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model AttendanceDaily {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Nullable — Student/Section don't carry branchId yet. Populated by the
+  // service when request-context resolves a branch; null = school-wide.
+  branchId       String? @map("branch_id") @db.Char(36)
+  academicYearId String  @map("academic_year_id") @db.Char(36)
+  sectionId      String  @map("section_id") @db.Char(36)
+  studentId      String  @map("student_id") @db.Char(36)
+
+  date   DateTime         @db.Date
+  status AttendanceStatus
+  source AttendanceSource @default(MANUAL)
+
+  markedAt     DateTime  @map("marked_at") @db.Timestamp(3)
+  markedBy     String?   @map("marked_by") @db.Char(36)
+  checkInTime  DateTime? @map("check_in_time") @db.Timestamp(3)
+  checkOutTime DateTime? @map("check_out_time") @db.Timestamp(3)
+  remarks      String?   @db.VarChar(500)
+
+  // Reserved for future use behind `attendance.period_wise` /
+  // `attendance.subject_wise` flags. Null in MVP.
+  mode         AttendanceMode @default(DAILY)
+  periodNumber Int?           @map("period_number")
+  subjectId    String?        @map("subject_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  academicYear AcademicYear @relation("AcademicYearAttendanceDaily", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_att_daily_year")
+  section      Section      @relation("SectionAttendanceDaily", fields: [schoolId, sectionId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_att_daily_section")
+  student      Student      @relation("StudentAttendanceDaily", fields: [schoolId, studentId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_att_daily_student")
+  branch       Branch?      @relation("BranchAttendanceDaily", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_att_daily_branch")
+
+  history     AttendanceStatusHistory[] @relation("AttendanceDailyHistory")
+  corrections AttendanceCorrection[]    @relation("AttendanceDailyCorrections")
+
+  @@id([schoolId, id])
+  // Active-row uniqueness on (school, student, date) is enforced via a
+  // STORED `deleted_at_key` column + `uq_att_daily_active` index added in
+  // the migration (same NULL-collapse trick as
+  // `working_days_configuration.branch_key`).
+  @@index([schoolId, sectionId, date], map: "ix_att_daily_school_section_date")
+  @@index([schoolId, date, status], map: "ix_att_daily_school_date_status")
+  @@index([schoolId, studentId, date(sort: Desc)], map: "ix_att_daily_school_student_date")
+  @@index([schoolId, branchId, date], map: "ix_att_daily_school_branch_date")
+  @@index([schoolId, academicYearId], map: "ix_att_daily_school_year")
+  @@index([schoolId, deletedAt], map: "ix_att_daily_deleted_at")
+  @@map("attendance_daily")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model StaffAttendance {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  branchId String? @map("branch_id") @db.Char(36)
+  staffId  String  @map("staff_id") @db.Char(36)
+
+  date   DateTime         @db.Date
+  status AttendanceStatus
+  source AttendanceSource @default(MANUAL)
+
+  markedAt     DateTime  @map("marked_at") @db.Timestamp(3)
+  markedBy     String?   @map("marked_by") @db.Char(36)
+  checkInTime  DateTime? @map("check_in_time") @db.Timestamp(3)
+  checkOutTime DateTime? @map("check_out_time") @db.Timestamp(3)
+  remarks      String?   @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  staff  Staff   @relation("StaffAttendanceEntries", fields: [schoolId, staffId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_staff_att_staff")
+  branch Branch? @relation("BranchStaffAttendance", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_staff_att_branch")
+
+  @@id([schoolId, id])
+  // Active-row uniqueness on (school, staff, date) via STORED
+  // `deleted_at_key` + `uq_staff_att_active` in the migration.
+  @@index([schoolId, staffId, date(sort: Desc)], map: "ix_staff_att_school_staff_date")
+  @@index([schoolId, date, status], map: "ix_staff_att_school_date_status")
+  @@index([schoolId, branchId, date], map: "ix_staff_att_school_branch_date")
+  @@index([schoolId, deletedAt], map: "ix_staff_att_deleted_at")
+  @@map("staff_attendance")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model AttendanceLockWindow {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  scope     AttendanceLockScope
+  // Required when scope=BRANCH or scope=SECTION (DTO enforces).
+  branchId  String?             @map("branch_id") @db.Char(36)
+  sectionId String?             @map("section_id") @db.Char(36)
+
+  startDate DateTime @map("start_date") @db.Date
+  endDate   DateTime @map("end_date") @db.Date
+  reason    String?  @db.VarChar(255)
+
+  lockedBy String?  @map("locked_by") @db.Char(36)
+  lockedAt DateTime @default(now()) @map("locked_at") @db.Timestamp(3)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  // Soft-delete = "unlocked".
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  branch  Branch?  @relation("BranchAttendanceLocks", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_att_lock_branch")
+  section Section? @relation("SectionAttendanceLocks", fields: [schoolId, sectionId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_att_lock_section")
+
+  @@id([schoolId, id])
+  @@index([schoolId, branchId, startDate, endDate], map: "ix_att_lock_school_branch_range")
+  @@index([schoolId, sectionId, startDate, endDate], map: "ix_att_lock_school_section_range")
+  @@index([schoolId, scope, startDate, endDate], map: "ix_att_lock_school_scope_range")
+  @@index([schoolId, deletedAt], map: "ix_att_lock_deleted_at")
+  @@map("attendance_lock_windows")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model AttendanceCorrection {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  attendanceDailyId String @map("attendance_daily_id") @db.Char(36)
+
+  requestedBy String   @map("requested_by") @db.Char(36)
+  requestedAt DateTime @default(now()) @map("requested_at") @db.Timestamp(3)
+
+  previousStatus   AttendanceStatus @map("previous_status")
+  newStatus        AttendanceStatus @map("new_status")
+  reason           String           @db.VarChar(500)
+  // Optional FK to a FileAsset (supporting document).
+  // Plain ID — FileAsset is TENANT_SHARED_PLATFORM and crossing scope
+  // boundaries via composite FK adds noise. Service validates existence.
+  supportingFileId String?          @map("supporting_file_id") @db.Char(36)
+
+  status         AttendanceCorrectionStatus @default(PENDING)
+  decidedBy      String?                    @map("decided_by") @db.Char(36)
+  decidedAt      DateTime?                  @map("decided_at") @db.Timestamp(3)
+  decisionReason String?                    @map("decision_reason") @db.VarChar(500)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  attendanceDaily AttendanceDaily @relation("AttendanceDailyCorrections", fields: [schoolId, attendanceDailyId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_att_correction_daily")
+
+  @@id([schoolId, id])
+  @@index([schoolId, status, requestedAt(sort: Desc)], map: "ix_att_correction_school_status_requested")
+  @@index([schoolId, attendanceDailyId], map: "ix_att_correction_school_daily")
+  @@index([schoolId, requestedBy], map: "ix_att_correction_school_requester")
+  @@map("attendance_corrections")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model AttendanceStatusHistory {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  attendanceDailyId String @map("attendance_daily_id") @db.Char(36)
+
+  previousStatus AttendanceStatus?           @map("previous_status")
+  newStatus      AttendanceStatus            @map("new_status")
+  changeType     AttendanceHistoryChangeType @map("change_type")
+
+  changedBy    String?  @map("changed_by") @db.Char(36)
+  changedAt    DateTime @default(now()) @map("changed_at") @db.Timestamp(3)
+  reason       String?  @db.VarChar(255)
+  // Optional pointer to the AttendanceCorrection row that drove this entry.
+  correctionId String?  @map("correction_id") @db.Char(36)
+
+  attendanceDaily AttendanceDaily @relation("AttendanceDailyHistory", fields: [schoolId, attendanceDailyId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_att_history_daily")
+
+  @@id([schoolId, id])
+  @@index([schoolId, attendanceDailyId, changedAt(sort: Desc)], map: "ix_att_history_school_daily_changed")
+  @@index([schoolId, changedAt(sort: Desc)], map: "ix_att_history_school_changed")
+  @@map("attendance_status_history")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model AttendanceConfig {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Null = school-wide default; non-null = branch override.
+  branchId String? @map("branch_id") @db.Char(36)
+
+  editWindowHours            Int     @default(24) @map("edit_window_hours")
+  lateThresholdMinutes       Int     @default(15) @map("late_threshold_minutes")
+  correctionsRequireApproval Boolean @default(true) @map("corrections_require_approval")
+  // Whitelist of allowed sources for new marks. MVP: ["MANUAL"]. Biometric
+  // / mobile-app additions come via feature flags + this list.
+  allowedSources             Json    @default("[\"MANUAL\"]") @map("allowed_sources")
+  holidayAutoMark            Boolean @default(true) @map("holiday_auto_mark")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  branch Branch? @relation("BranchAttendanceConfig", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_att_config_branch")
+
+  @@id([schoolId, id])
+  // Active-row uniqueness on (school, branch?) via STORED `branch_id_key` +
+  // `deleted_at_key` columns added in the migration.
+  @@index([schoolId, branchId], map: "ix_att_config_school_branch")
+  @@index([schoolId, deletedAt], map: "ix_att_config_deleted_at")
+  @@map("attendance_configurations")
+}

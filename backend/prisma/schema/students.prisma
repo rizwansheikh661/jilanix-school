@@ -1,0 +1,549 @@
+// ---------------------------------------------------------------------------
+// students.prisma — Enrollment domain (Sprint 3).
+//
+// Three resources, six tables:
+//   - `Student`             — master profile. One row per admitted child;
+//                             current academic year / class / section / status
+//                             live as columns (no per-year history this sprint).
+//   - `Parent`              — one row per family. Holds three column-groups
+//                             (father / mother / guardian) plus address. Linked
+//                             to N students via `ParentStudentLink`.
+//   - `ParentStudentLink`   — M:N parent ↔ student with relation slot
+//                             (FATHER / MOTHER / GUARDIAN), primary-contact
+//                             flag, pickup flag.
+//   - `Admission`           — workflow row. State machine
+//                             DRAFT → SUBMITTED → APPROVED|REJECTED|WITHDRAWN.
+//                             On APPROVED, AdmissionService transactionally
+//                             creates the linked Student + Parent rows.
+//   - `AdmissionDocument`   — metadata-only document records attached to an
+//                             admission (storageUrl is treated as opaque this
+//                             sprint; upload pipeline is a later story).
+//   - `AdmissionHistory`    — append-only log of state transitions; one row
+//                             per transition, written in the same transaction.
+//
+// Out of scope this sprint: student_enrollments (per-year history), transfers,
+// transfer certificates, houses, pickup auths, health records, parent
+// communication prefs, parent messages, leave applications. See plan §Context.
+//
+// All TENANT_OWNED with composite (school_id, id) PKs and composite FKs into
+// the academic foundation. Soft delete via `deletedAt` on Student / Parent /
+// Admission only — link / document / history rows cascade-delete with their
+// parent.
+// ---------------------------------------------------------------------------
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum StudentStatus {
+  ACTIVE
+  INACTIVE
+  GRADUATED
+  TC_ISSUED
+  EXPELLED
+}
+
+enum AdmissionStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  WITHDRAWN
+}
+
+enum ParentRelation {
+  FATHER
+  MOTHER
+  GUARDIAN
+  GRANDPARENT
+  OTHER
+}
+
+/// Sprint 17 — lifecycle status of a `ParentUser` (parent ↔ user link).
+/// Drives `/me/*` access and the invitation/activation workflow.
+enum ParentUserStatus {
+  PENDING_INVITE
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+/// Sprint 18 — lifecycle status of a `StudentUser` (student ↔ user link).
+/// Distinct from the academic `StudentStatus` enum; this only governs
+/// login/portal access. Drives `/me/*` access and the invitation flow.
+enum StudentUserStatus {
+  PENDING_INVITE
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+enum Religion {
+  HINDU
+  MUSLIM
+  CHRISTIAN
+  SIKH
+  BUDDHIST
+  JAIN
+  PARSI
+  JEWISH
+  OTHER
+  NOT_DECLARED
+}
+
+enum SocialCategory {
+  GENERAL
+  OBC
+  SC
+  ST
+  EWS
+  NOT_DECLARED
+}
+
+enum AdmissionType {
+  FRESH
+  TRANSFER
+  RTE
+  MANAGEMENT
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=enrollment
+model Student {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Profile
+  firstName   String   @map("first_name") @db.VarChar(100)
+  lastName    String   @map("last_name") @db.VarChar(100)
+  dateOfBirth DateTime @map("date_of_birth") @db.Date
+  gender      Gender
+  bloodGroup  String?  @map("blood_group") @db.VarChar(5)
+  // Opaque URL — file upload pipeline ships in a later sprint.
+  photoUrl    String?  @map("photo_url") @db.VarChar(500)
+
+  // Identity
+  admissionNo String  @map("admission_no") @db.VarChar(80)
+  // Nullable — students may be admitted before the section roll is finalized.
+  // Service enforces uniqueness within (sectionId, academicYearId) when set.
+  rollNo      String? @map("roll_no") @db.VarChar(20)
+
+  // Current placement (composite FKs preserve tenant scope at the DB layer).
+  academicYearId String @map("academic_year_id") @db.Char(36)
+  classId        String @map("class_id") @db.Char(36)
+  sectionId      String @map("section_id") @db.Char(36)
+
+  // Lifecycle
+  status     StudentStatus @default(ACTIVE)
+  admittedOn DateTime      @map("admitted_on") @db.Date
+
+  // -----------------------------------------------------------------------
+  // Indian-school compliance fields (Sprint 4 — UDISE+, RTE §12(1)(c), DBT,
+  // DPDP Act 2023). All nullable / defaulted so the additive migration is
+  // safe over existing rows. Aadhaar is encrypted at rest via CryptoService;
+  // only `aadhaarLast4` is ever returned in API responses.
+  // -----------------------------------------------------------------------
+  religion             Religion?       @default(NOT_DECLARED)
+  category             SocialCategory? @default(NOT_DECLARED)
+  nationality          String          @default("Indian") @db.VarChar(80)
+  motherTongue         String?         @map("mother_tongue") @db.VarChar(80)
+  aadhaarEncrypted     String?         @map("aadhaar_encrypted") @db.Text
+  aadhaarLast4         String?         @map("aadhaar_last4") @db.Char(4)
+  apaarId              String?         @map("apaar_id") @db.VarChar(20)
+  isCwsn               Boolean         @default(false) @map("is_cwsn")
+  disabilityType       String?         @map("disability_type") @db.VarChar(80)
+  isRte                Boolean         @default(false) @map("is_rte")
+  isMinority           Boolean         @default(false) @map("is_minority")
+  minorityCommunity    String?         @map("minority_community") @db.VarChar(40)
+  isBpl                Boolean         @default(false) @map("is_bpl")
+  previousSchoolName   String?         @map("previous_school_name") @db.VarChar(200)
+  previousSchoolTcNo   String?         @map("previous_school_tc_no") @db.VarChar(80)
+  previousSchoolTcDate DateTime?       @map("previous_school_tc_date") @db.Date
+  admissionType        AdmissionType?  @default(FRESH) @map("admission_type")
+  placeOfBirth         String?         @map("place_of_birth") @db.VarChar(120)
+  birthCertNo          String?         @map("birth_cert_no") @db.VarChar(60)
+
+  // Up to 5 contacts; validated in DTO. JSON is the simplest fit for a small
+  // bounded array — we don't query into it, only round-trip it.
+  emergencyContacts Json @map("emergency_contacts")
+
+  // Sprint 4.5 — current house (denormalised for fast filtering on student-
+  // list screens). Authoritative history lives in `house_assignments`. Only
+  // HouseAssignmentService writes this column. SetNull on house deletion.
+  houseId String? @map("house_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  academicYear AcademicYear @relation("AcademicYearStudents", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_students_academic_year")
+  class        Class        @relation("ClassStudents", fields: [schoolId, classId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_students_class")
+  section      Section      @relation("SectionStudents", fields: [schoolId, sectionId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_students_section")
+  // Sprint 4.5 — denormalised current-house pointer.
+  house        House?       @relation("StudentHouse", fields: [schoolId, houseId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_students_house")
+
+  parentLinks         ParentStudentLink[]  @relation("StudentParentLinks")
+  houseAssignments    HouseAssignment[]    @relation("StudentHouseAssignments")
+  housesAsCaptain     House[]              @relation("HouseCaptain")
+  housesAsViceCaptain House[]              @relation("HouseViceCaptain")
+  // Sprint 6 relations.
+  attendanceDaily     AttendanceDaily[]    @relation("StudentAttendanceDaily")
+  // Sprint 8 relations.
+  examMarks           ExamMarks[]          @relation("StudentExamMarks")
+  examResults         ExamResult[]         @relation("StudentExamResults")
+  // Sprint 9 relations.
+  feeStructures       FeeStructure[]       @relation("StudentFeeStructures")
+  feeDiscounts        StudentFeeDiscount[] @relation("StudentFeeDiscounts")
+  feeInvoices         FeeInvoice[]         @relation("StudentFeeInvoices")
+  feePayments         FeePayment[]         @relation("StudentFeePayments")
+  feeReceipts         FeeReceipt[]         @relation("StudentFeeReceipts")
+  // Sprint 18 — login-capable users linked to this student. One-to-one in
+  // practice (enforced by the partial-unique indexes on student_users);
+  // typed as a list because Prisma models the relation generically.
+  users               StudentUser[]        @relation("StudentUserStudent")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, admissionNo], map: "uq_students_school_admission_no")
+  // APAAR uniqueness is partial (only when non-null); MySQL has no partial
+  // unique, so this is a regular unique that treats NULLs as distinct.
+  @@unique([schoolId, apaarId], map: "uq_students_school_apaar")
+  @@index([schoolId, status], map: "ix_students_school_status")
+  @@index([schoolId, classId, sectionId], map: "ix_students_school_class_section")
+  // Roll uniqueness is partial (only when rollNo is non-null) and MySQL has no
+  // partial unique index — service enforces, this index is just for lookups.
+  @@index([schoolId, sectionId, academicYearId, rollNo], map: "ix_students_section_year_roll")
+  @@index([schoolId, lastName, firstName], map: "ix_students_school_name")
+  // Indian-school aggregation / lookup indexes.
+  @@index([schoolId, aadhaarLast4], map: "ix_students_school_aadhaar_last4")
+  @@index([schoolId, category], map: "ix_students_school_category")
+  @@index([schoolId, isRte], map: "ix_students_school_rte")
+  @@index([schoolId, houseId], map: "ix_students_school_house")
+  @@map("students")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=enrollment
+model Parent {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Father details
+  fatherName       String? @map("father_name") @db.VarChar(200)
+  fatherPhone      String? @map("father_phone") @db.VarChar(20)
+  fatherEmail      String? @map("father_email") @db.VarChar(255)
+  fatherOccupation String? @map("father_occupation") @db.VarChar(100)
+
+  // Mother details
+  motherName       String? @map("mother_name") @db.VarChar(200)
+  motherPhone      String? @map("mother_phone") @db.VarChar(20)
+  motherEmail      String? @map("mother_email") @db.VarChar(255)
+  motherOccupation String? @map("mother_occupation") @db.VarChar(100)
+
+  // Guardian details (optional alternate contact, e.g. uncle / grandparent).
+  guardianName       String? @map("guardian_name") @db.VarChar(200)
+  guardianPhone      String? @map("guardian_phone") @db.VarChar(20)
+  guardianEmail      String? @map("guardian_email") @db.VarChar(255)
+  guardianOccupation String? @map("guardian_occupation") @db.VarChar(100)
+  // E.g. "Uncle", "Grandfather". Free-form within length cap.
+  guardianRelation   String? @map("guardian_relation") @db.VarChar(50)
+
+  // Family address — single residence; if the family lives in two places, that
+  // edge case is handled by creating a second Parent row per house.
+  addressLine1 String  @map("address_line1") @db.VarChar(200)
+  addressLine2 String? @map("address_line2") @db.VarChar(200)
+  city         String  @db.VarChar(80)
+  state        String  @db.VarChar(80)
+  postalCode   String  @map("postal_code") @db.VarChar(20)
+  country      String  @default("IN") @db.VarChar(80)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  studentLinks ParentStudentLink[] @relation("ParentStudentLinks")
+  // Sprint 17 — login-capable users linked into this family. One row per
+  // (parent, user, relation); lifecycle drives /me/* access.
+  users        ParentUser[]        @relation("ParentUserParent")
+
+  @@id([schoolId, id])
+  @@index([schoolId, fatherPhone], map: "ix_parents_school_father_phone")
+  @@index([schoolId, motherPhone], map: "ix_parents_school_mother_phone")
+  @@index([schoolId, guardianPhone], map: "ix_parents_school_guardian_phone")
+  @@map("parents")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=enrollment
+/// Sprint 17 — Parent ↔ User junction. Carries the parent-portal lifecycle
+/// (PENDING_INVITE → ACTIVE → SUSPENDED → ARCHIVED). Cardinality:
+/// one User → one Parent family, enforced by the partial-unique on
+/// (school_id, user_id, deleted_at_key). Strict-unique (school_id,
+/// parent_id, user_id) prevents accidental duplicate links on the same family.
+model ParentUser {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  parentId String         @map("parent_id") @db.Char(36)
+  userId   String         @map("user_id") @db.Char(36)
+  relation ParentRelation
+
+  status ParentUserStatus @default(PENDING_INVITE)
+
+  invitedAt    DateTime? @map("invited_at") @db.Timestamp(3)
+  activatedAt  DateTime? @map("activated_at") @db.Timestamp(3)
+  suspendedAt  DateTime? @map("suspended_at") @db.Timestamp(3)
+  archivedAt   DateTime? @map("archived_at") @db.Timestamp(3)
+  lastInviteAt DateTime? @map("last_invite_at") @db.Timestamp(3)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  parent Parent @relation("ParentUserParent", fields: [schoolId, parentId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_parent_users_parent")
+  user   User   @relation("ParentUserUser", fields: [schoolId, userId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_parent_users_user")
+
+  @@id([schoolId, id])
+  // Strict-unique: no duplicate (parent, user) within the same school
+  // (enforced regardless of soft-delete state — re-inviting the same user
+  // into the same family must reuse the existing row).
+  @@unique([schoolId, parentId, userId], map: "uq_parent_user_parent_user")
+  @@index([schoolId, userId], map: "ix_parent_user_user")
+  @@index([schoolId, parentId], map: "ix_parent_user_parent")
+  @@index([schoolId, deletedAt], map: "ix_parent_user_deleted_at")
+  @@map("parent_users")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=enrollment
+/// Sprint 18 — Student ↔ User junction. Mirrors `ParentUser` but enforces
+/// strict 1:1 cardinality in both directions (one alive User per Student,
+/// one alive Student per User) via two partial-unique indexes on
+/// (school_id, *, deleted_at_key). Lifecycle drives `/me/*` access.
+model StudentUser {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  studentId String @map("student_id") @db.Char(36)
+  userId    String @map("user_id") @db.Char(36)
+
+  status StudentUserStatus @default(PENDING_INVITE)
+
+  invitedAt    DateTime? @map("invited_at") @db.Timestamp(3)
+  activatedAt  DateTime? @map("activated_at") @db.Timestamp(3)
+  suspendedAt  DateTime? @map("suspended_at") @db.Timestamp(3)
+  archivedAt   DateTime? @map("archived_at") @db.Timestamp(3)
+  lastInviteAt DateTime? @map("last_invite_at") @db.Timestamp(3)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  student Student @relation("StudentUserStudent", fields: [schoolId, studentId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_student_users_student")
+  user    User    @relation("StudentUserUser", fields: [schoolId, userId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_student_users_user")
+
+  @@id([schoolId, id])
+  // Strict-unique: no duplicate (student, user) within the same school
+  // (enforced regardless of soft-delete state — re-inviting the same user
+  // for the same student must reuse the existing row).
+  @@unique([schoolId, studentId, userId], map: "uq_student_user_student_user")
+  @@index([schoolId, userId], map: "ix_student_user_user")
+  @@index([schoolId, studentId], map: "ix_student_user_student")
+  @@index([schoolId, deletedAt], map: "ix_student_user_deleted_at")
+  @@map("student_users")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=enrollment
+model ParentStudentLink {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  parentId  String @map("parent_id") @db.Char(36)
+  studentId String @map("student_id") @db.Char(36)
+
+  // Identifies WHICH slot on the parent record (father / mother / guardian)
+  // this link represents. A single Parent row can host up to three FATHER /
+  // MOTHER / GUARDIAN links into the same Student.
+  relation         ParentRelation
+  isPrimaryContact Boolean        @default(false) @map("is_primary_contact")
+  canPickup        Boolean        @default(true) @map("can_pickup")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+
+  parent  Parent  @relation("ParentStudentLinks", fields: [schoolId, parentId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_pslink_parent")
+  student Student @relation("StudentParentLinks", fields: [schoolId, studentId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_pslink_student")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, parentId, studentId, relation], map: "uq_pslink_parent_student_relation")
+  @@index([schoolId, studentId], map: "ix_pslink_school_student")
+  @@index([schoolId, parentId], map: "ix_pslink_school_parent")
+  @@map("parent_student_links")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=enrollment
+model Admission {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  status AdmissionStatus @default(DRAFT)
+
+  // Candidate snapshot — copied from the request body so the admission record
+  // stands alone before being applied (and survives unchanged afterward).
+  firstName   String   @map("first_name") @db.VarChar(100)
+  lastName    String   @map("last_name") @db.VarChar(100)
+  dateOfBirth DateTime @map("date_of_birth") @db.Date
+  gender      Gender
+  bloodGroup  String?  @map("blood_group") @db.VarChar(5)
+
+  // Target placement — plain ID columns (no FK); the AdmissionService
+  // validates these against academic.prisma at submit / approve time. This
+  // keeps the admission record durable even if a class is later renamed or
+  // soft-deleted, and avoids a chain of @relation back-pointers.
+  targetAcademicYearId String @map("target_academic_year_id") @db.Char(36)
+  targetClassId        String @map("target_class_id") @db.Char(36)
+  targetSectionId      String @map("target_section_id") @db.Char(36)
+
+  // Proposed identity. admissionNo can be assigned at any state but must be
+  // present on approve. Service enforces uniqueness within school.
+  admissionNo String? @map("admission_no") @db.VarChar(80)
+  rollNo      String? @map("roll_no") @db.VarChar(20)
+
+  // Parent snapshot — same shape as Parent so approve can copy verbatim.
+  fatherName         String? @map("father_name") @db.VarChar(200)
+  fatherPhone        String? @map("father_phone") @db.VarChar(20)
+  fatherEmail        String? @map("father_email") @db.VarChar(255)
+  fatherOccupation   String? @map("father_occupation") @db.VarChar(100)
+  motherName         String? @map("mother_name") @db.VarChar(200)
+  motherPhone        String? @map("mother_phone") @db.VarChar(20)
+  motherEmail        String? @map("mother_email") @db.VarChar(255)
+  motherOccupation   String? @map("mother_occupation") @db.VarChar(100)
+  guardianName       String? @map("guardian_name") @db.VarChar(200)
+  guardianPhone      String? @map("guardian_phone") @db.VarChar(20)
+  guardianEmail      String? @map("guardian_email") @db.VarChar(255)
+  guardianOccupation String? @map("guardian_occupation") @db.VarChar(100)
+  guardianRelation   String? @map("guardian_relation") @db.VarChar(50)
+  addressLine1       String  @map("address_line1") @db.VarChar(200)
+  addressLine2       String? @map("address_line2") @db.VarChar(200)
+  city               String  @db.VarChar(80)
+  state              String  @db.VarChar(80)
+  postalCode         String  @map("postal_code") @db.VarChar(20)
+  country            String  @default("IN") @db.VarChar(80)
+
+  // -----------------------------------------------------------------------
+  // Indian-school snapshot — mirrors Student. Copied verbatim into the new
+  // Student row when AdmissionService approves the application.
+  // -----------------------------------------------------------------------
+  religion             Religion?       @default(NOT_DECLARED)
+  category             SocialCategory? @default(NOT_DECLARED)
+  nationality          String          @default("Indian") @db.VarChar(80)
+  motherTongue         String?         @map("mother_tongue") @db.VarChar(80)
+  aadhaarEncrypted     String?         @map("aadhaar_encrypted") @db.Text
+  aadhaarLast4         String?         @map("aadhaar_last4") @db.Char(4)
+  apaarId              String?         @map("apaar_id") @db.VarChar(20)
+  isCwsn               Boolean         @default(false) @map("is_cwsn")
+  disabilityType       String?         @map("disability_type") @db.VarChar(80)
+  isRte                Boolean         @default(false) @map("is_rte")
+  isMinority           Boolean         @default(false) @map("is_minority")
+  minorityCommunity    String?         @map("minority_community") @db.VarChar(40)
+  isBpl                Boolean         @default(false) @map("is_bpl")
+  previousSchoolName   String?         @map("previous_school_name") @db.VarChar(200)
+  previousSchoolTcNo   String?         @map("previous_school_tc_no") @db.VarChar(80)
+  previousSchoolTcDate DateTime?       @map("previous_school_tc_date") @db.Date
+  admissionType        AdmissionType?  @default(FRESH) @map("admission_type")
+  placeOfBirth         String?         @map("place_of_birth") @db.VarChar(120)
+  birthCertNo          String?         @map("birth_cert_no") @db.VarChar(60)
+
+  // Decision metadata — populated when status moves to APPROVED|REJECTED.
+  decidedBy    String?   @map("decided_by") @db.Char(36)
+  decidedAt    DateTime? @map("decided_at") @db.Timestamp(3)
+  decisionNote String?   @map("decision_note") @db.VarChar(500)
+
+  // Linkage — populated only after APPROVED. Plain ID columns; the resulting
+  // Student / Parent rows are the source of truth, and we do not navigate
+  // back to the admission from there.
+  studentId String? @map("student_id") @db.Char(36)
+  parentId  String? @map("parent_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  documents AdmissionDocument[] @relation("AdmissionDocuments")
+  history   AdmissionHistory[]  @relation("AdmissionHistoryEntries")
+
+  @@id([schoolId, id])
+  @@index([schoolId, status], map: "ix_admissions_school_status")
+  @@index([schoolId, targetAcademicYearId, targetClassId], map: "ix_admissions_school_target")
+  @@index([schoolId, admissionNo], map: "ix_admissions_school_admission_no")
+  @@map("admissions")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=enrollment
+model AdmissionDocument {
+  id          String @default(uuid()) @db.Char(36)
+  schoolId    String @map("school_id") @db.Char(36)
+  admissionId String @map("admission_id") @db.Char(36)
+
+  // Human-readable label, e.g. "Aadhaar", "PreviousMarksheet".
+  label      String   @db.VarChar(120)
+  fileName   String   @map("file_name") @db.VarChar(255)
+  mimeType   String   @map("mime_type") @db.VarChar(100)
+  sizeBytes  Int      @map("size_bytes")
+  // Treated as opaque this sprint — the upload pipeline ships later. Until
+  // then callers supply a pre-issued URL or a placeholder.
+  storageUrl String   @map("storage_url") @db.VarChar(1000)
+  uploadedBy String?  @map("uploaded_by") @db.Char(36)
+  uploadedAt DateTime @default(now()) @map("uploaded_at") @db.Timestamp(3)
+
+  admission Admission @relation("AdmissionDocuments", fields: [schoolId, admissionId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_adoc_admission")
+
+  @@id([schoolId, id])
+  @@index([schoolId, admissionId], map: "ix_adoc_school_admission")
+  @@map("admission_documents")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=enrollment
+model AdmissionHistory {
+  id          String @default(uuid()) @db.Char(36)
+  schoolId    String @map("school_id") @db.Char(36)
+  admissionId String @map("admission_id") @db.Char(36)
+
+  // Null for the initial DRAFT-creation entry; otherwise the prior status.
+  fromStatus AdmissionStatus? @map("from_status")
+  toStatus   AdmissionStatus  @map("to_status")
+  actorId    String?          @map("actor_id") @db.Char(36)
+  note       String?          @db.VarChar(500)
+  occurredAt DateTime         @default(now()) @map("occurred_at") @db.Timestamp(3)
+
+  admission Admission @relation("AdmissionHistoryEntries", fields: [schoolId, admissionId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_ahist_admission")
+
+  @@id([schoolId, id])
+  @@index([schoolId, admissionId, occurredAt], map: "ix_ahist_school_admission_occurred")
+  @@map("admission_history")
+}

@@ -1,0 +1,294 @@
+// ---------------------------------------------------------------------------
+// ops.prisma — Operational plumbing tables.
+//
+// These three tables underpin reliability primitives the platform leans on
+// from day one:
+//
+//   * Outbox            — transactional event publication. Any side-effect
+//                         (notification, webhook, integration push) is
+//                         written here in the same transaction as the
+//                         business state change; a relay process drains it
+//                         to the actual transport. Avoids dual-write bugs.
+//   * IdempotencyKey    — deduplicates retried client requests. Every
+//                         non-GET endpoint accepting `Idempotency-Key`
+//                         stores the request fingerprint + response here.
+//   * Job               — minimal queue ledger. Workers acquire rows under
+//                         `FOR UPDATE SKIP LOCKED`; richer scheduler lands
+//                         later. Sprint 1 only persists the shape.
+//
+// All three are CROSS_TENANT_OPERATIONAL — they hold tenant-scoped data
+// (and `school_id` is enforced by the tenant-scope extension when the
+// caller is a tenant actor) but the relay/worker processes are global and
+// must be able to read across tenants.
+// ---------------------------------------------------------------------------
+
+/// @scope CROSS_TENANT_OPERATIONAL
+model Outbox {
+  id       String  @id @default(uuid()) @db.Char(36)
+  schoolId String? @map("school_id") @db.Char(36)
+
+  // Logical channel — `notification.*`, `webhook.*`, `audit.*`, etc.
+  topic String @db.VarChar(100)
+
+  // Aggregate that produced the event, for ordering + replay scoping.
+  aggregateType String @map("aggregate_type") @db.VarChar(50)
+  aggregateId   String @map("aggregate_id") @db.Char(36)
+
+  // Producer-supplied identity for end-to-end deduplication across
+  // retries / re-emissions. Required.
+  eventId   String @map("event_id") @db.Char(26)
+  eventType String @map("event_type") @db.VarChar(100)
+
+  payload Json
+  headers Json?
+
+  status        String    @default("pending") @db.VarChar(20) // pending|claimed|delivered|failed|dead
+  attempts      Int       @default(0)
+  lastError     String?   @map("last_error") @db.Text
+  nextAttemptAt DateTime? @map("next_attempt_at") @db.Timestamp(3)
+  deliveredAt   DateTime? @map("delivered_at") @db.Timestamp(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  version   Int      @default(1)
+
+  @@unique([eventId], map: "uq_outbox_event_id")
+  @@index([status, nextAttemptAt], map: "ix_outbox_dispatch")
+  @@index([schoolId, topic, createdAt(sort: Desc)], map: "ix_outbox_school_topic")
+  @@map("outbox")
+}
+
+/// @scope CROSS_TENANT_OPERATIONAL
+model IdempotencyKey {
+  id       String  @id @default(uuid()) @db.Char(36)
+  schoolId String? @map("school_id") @db.Char(36)
+
+  // The verbatim header value the client sent.
+  key String @db.VarChar(255)
+
+  // SHA-256 of the canonicalised request (method + path + body) so a
+  // replay with a different payload but the same key is detected and
+  // rejected with 422 instead of returning the stale response.
+  requestFingerprint String @map("request_fingerprint") @db.Char(64)
+
+  resourceType String? @map("resource_type") @db.VarChar(50)
+  resourceId   String? @map("resource_id") @db.Char(36)
+
+  // Cached response surface (status, headers, body) so the second call
+  // returns byte-identical output to the first.
+  responseStatus Int?  @map("response_status")
+  responseBody   Json? @map("response_body")
+
+  status    String   @default("in_progress") @db.VarChar(20) // in_progress|completed|failed
+  expiresAt DateTime @map("expires_at") @db.Timestamp(3)
+
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  completedAt DateTime? @map("completed_at") @db.Timestamp(3)
+
+  @@unique([schoolId, key], map: "uq_idempotency_keys_school_key")
+  @@index([expiresAt], map: "ix_idempotency_keys_expires_at")
+  @@map("idempotency_keys")
+}
+
+/// @scope CROSS_TENANT_OPERATIONAL
+model Job {
+  id       String  @id @default(uuid()) @db.Char(36)
+  schoolId String? @map("school_id") @db.Char(36)
+
+  queue    String @db.VarChar(50)
+  type     String @db.VarChar(100)
+  payload  Json
+  priority Int    @default(0)
+
+  status      String    @default("queued") @db.VarChar(20) // queued|claimed|running|completed|failed|dead
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5) @map("max_attempts")
+  runAt       DateTime  @default(now()) @map("run_at") @db.Timestamp(3)
+  claimedAt   DateTime? @map("claimed_at") @db.Timestamp(3)
+  claimedBy   String?   @map("claimed_by") @db.VarChar(100)
+  startedAt   DateTime? @map("started_at") @db.Timestamp(3)
+  completedAt DateTime? @map("completed_at") @db.Timestamp(3)
+  lastError   String?   @map("last_error") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  version   Int      @default(1)
+
+  @@index([queue, status, runAt, priority], map: "ix_jobs_dispatch")
+  @@index([schoolId, type, status], map: "ix_jobs_school_type_status")
+  @@map("jobs")
+}
+
+// ---------------------------------------------------------------------------
+// JobDefinition / JobRun / JobDeadLetter — Sprint 5 background-jobs split.
+//
+// The original `Job` model above is the work-item ledger (claim row, retry
+// counter, status). Sprint 5 adds three companion tables so the platform
+// can:
+//
+//   * Define recurring or on-demand jobs by name + handler + cron
+//     (`JobDefinition`).
+//   * Record every execution attempt independently of the work-item row,
+//     which is recyclable / pruneable (`JobRun`).
+//   * Quarantine failed work after `max_attempts` for human triage and
+//     replay (`JobDeadLetter`).
+//
+// Today the processor is in-process (`JOBS_PROCESSOR_ENABLED=true`); the
+// shape supports moving to BullMQ + Redis later without schema churn.
+// ---------------------------------------------------------------------------
+
+enum JobRunStatus {
+  RUNNING
+  SUCCESS
+  FAILED
+}
+
+enum JobDeadLetterStatus {
+  PENDING
+  REPLAYED
+  ARCHIVED
+}
+
+/// @scope CROSS_TENANT_OPERATIONAL
+/// @audit category=general
+model JobDefinition {
+  id       String  @id @default(uuid()) @db.Char(36)
+  schoolId String? @map("school_id") @db.Char(36)
+
+  name            String  @db.VarChar(100)
+  queue           String  @db.VarChar(50)
+  handlerName     String  @map("handler_name") @db.VarChar(120)
+  // Null = on-demand only. 5-field cron when set (regex-validated app-side).
+  scheduleCron    String? @map("schedule_cron") @db.VarChar(100)
+  payloadTemplate Json?   @map("payload_template")
+  isActive        Boolean @default(true) @map("is_active")
+  description     String? @db.VarChar(500)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  school School?         @relation("SchoolJobDefinitions", fields: [schoolId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_job_def_school")
+  runs   JobRun[]        @relation("JobDefinitionRuns")
+  dlq    JobDeadLetter[] @relation("JobDefinitionDlq")
+
+  @@unique([schoolId, name], map: "uq_job_def_school_name")
+  @@index([queue, isActive], map: "ix_job_def_queue_active")
+  @@index([handlerName], map: "ix_job_def_handler")
+  @@map("job_definitions")
+}
+
+/// @scope CROSS_TENANT_OPERATIONAL
+model JobRun {
+  id String @id @default(uuid()) @db.Char(36)
+
+  // Optional pointers — JobRun can outlive the work-item row (jobs table is
+  // pruneable) and can be synthetic (no work-item row at all).
+  jobId        String? @map("job_id") @db.Char(36)
+  definitionId String? @map("definition_id") @db.Char(36)
+  schoolId     String? @map("school_id") @db.Char(36)
+
+  queue       String @db.VarChar(50)
+  handlerName String @map("handler_name") @db.VarChar(120)
+  attempt     Int
+
+  status       JobRunStatus
+  startedAt    DateTime     @map("started_at") @db.Timestamp(3)
+  finishedAt   DateTime?    @map("finished_at") @db.Timestamp(3)
+  errorMessage String?      @map("error_message") @db.Text
+  errorCode    String?      @map("error_code") @db.VarChar(100)
+  outputJson   Json?        @map("output_json")
+  durationMs   Int?         @map("duration_ms")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+
+  definition JobDefinition? @relation("JobDefinitionRuns", fields: [definitionId], references: [id], onDelete: SetNull, onUpdate: Restrict, map: "fk_job_run_definition")
+
+  @@index([definitionId, startedAt(sort: Desc)], map: "ix_job_run_definition_started")
+  @@index([jobId], map: "ix_job_run_job")
+  @@index([schoolId, startedAt(sort: Desc)], map: "ix_job_run_school_started")
+  @@index([status, startedAt(sort: Desc)], map: "ix_job_run_status_started")
+  @@map("job_runs")
+}
+
+/// @scope CROSS_TENANT_OPERATIONAL
+/// @audit category=general
+model JobDeadLetter {
+  id String @id @default(uuid()) @db.Char(36)
+
+  jobId        String  @map("job_id") @db.Char(36)
+  definitionId String? @map("definition_id") @db.Char(36)
+  schoolId     String? @map("school_id") @db.Char(36)
+
+  queue       String @db.VarChar(50)
+  handlerName String @map("handler_name") @db.VarChar(120)
+  payload     Json
+  attempts    Int
+
+  firstFailedAt DateTime            @map("first_failed_at") @db.Timestamp(3)
+  lastFailedAt  DateTime            @map("last_failed_at") @db.Timestamp(3)
+  lastError     String?             @map("last_error") @db.Text
+  status        JobDeadLetterStatus @default(PENDING)
+  replayedAt    DateTime?           @map("replayed_at") @db.Timestamp(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  definition JobDefinition? @relation("JobDefinitionDlq", fields: [definitionId], references: [id], onDelete: SetNull, onUpdate: Restrict, map: "fk_jdl_definition")
+
+  @@index([status, lastFailedAt(sort: Desc)], map: "ix_jdl_status_lastfailed")
+  @@index([schoolId, status], map: "ix_jdl_school_status")
+  @@index([jobId], map: "ix_jdl_job")
+  @@map("job_dead_letters")
+}
+
+// ---------------------------------------------------------------------------
+// TenantSequence — per-tenant gap-free counters.
+//
+// Backs admissionNo, employeeCode, future receiptNo / certificateNo / TC#.
+// `SequenceService.nextValue(name, fiscalYear?)` allocates the next integer
+// inside a `SELECT ... FOR UPDATE` block, so concurrent callers serialise
+// without collisions. Sequences participate in the outer business
+// transaction — an aborted operation rolls the counter increment back too,
+// preserving gap-free semantics (BUSINESS_RULES §11).
+//
+// MySQL caveat: NULLs in a unique index are treated as distinct, so the
+// "(school, name) with optional fiscal year" uniqueness is enforced via a
+// generated computed column `fiscal_year_key` added by the migration
+// (Prisma has no first-class GENERATED column DDL — the migration is
+// hand-extended after generation).
+// ---------------------------------------------------------------------------
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model TenantSequence {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Canonical from SEQ_NAMES in core/sequences: 'admission' | 'employee' |
+  // 'invoice' | 'receipt' | 'tc' | 'certificate'.
+  sequenceName String  @map("sequence_name") @db.VarChar(100)
+  // 'YYYY-YY' (e.g. '2026-27') for fiscal-year-scoped sequences
+  // (invoice, receipt). NULL for evergreen sequences (employee, admission).
+  fiscalYear   String? @map("fiscal_year") @db.Char(7)
+
+  // BIGINT — bounds future-proof; service surfaces as a JS number via
+  // explicit cast. Reaching 2^53 would imply > 9 quadrillion allocations
+  // per tenant per sequence.
+  lastValue BigInt @default(0) @map("last_value")
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+
+  @@id([schoolId, id])
+  // The actual partial-unique on (schoolId, sequenceName, fiscalYear) is
+  // implemented in the migration via a generated column `fiscal_year_key`
+  // (COALESCE(fiscal_year, '__none__')). This index supports the lookup
+  // and is non-unique to avoid the NULL-distinctness pitfall.
+  @@index([schoolId, sequenceName, fiscalYear], map: "ix_tenant_sequences_school_name_fy")
+  @@map("tenant_sequences")
+}

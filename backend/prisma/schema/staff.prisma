@@ -1,0 +1,381 @@
+// ---------------------------------------------------------------------------
+// staff.prisma — Staff domain (Sprint 4).
+//
+// Eight tables, all TENANT_OWNED with composite (school_id, id) PKs:
+//
+//   - `Staff`                       — master profile. One row per teacher /
+//                                     non-teaching employee. PII columns
+//                                     (Aadhaar / PAN / bank account) are
+//                                     encrypted at rest via CryptoService;
+//                                     only the matching `_last4` columns are
+//                                     ever returned in API responses.
+//   - `StaffEmploymentHistory`      — append-only event log: JOINED,
+//                                     PROMOTED, RESIGNED, etc. Written by
+//                                     StaffService whenever a lifecycle
+//                                     transition occurs.
+//   - `StaffQualification`          — degrees / certifications / experience.
+//                                     1:N with Staff. Free-form rows; no
+//                                     reference table.
+//   - `StaffSubjectQualification`   — M:N staff ↔ subject. Drives the
+//                                     teacher-picker on timetable / exam
+//                                     screens in later sprints.
+//   - `StaffSectionAssignment`      — teacher ↔ section ↔ subject ↔ year.
+//                                     Seeds the timetable model (Sprint 12);
+//                                     multiple teachers per (section,
+//                                     subject) slot are allowed (split
+//                                     periods).
+//   - `ClassTeacher`                — homeroom assignment. One active row
+//                                     per (section, academic year); the
+//                                     unique constraint is enforced in the
+//                                     service layer because MySQL has no
+//                                     partial unique index.
+//   - `StaffLeave`                  — leave request lifecycle
+//                                     DRAFT → SUBMITTED → APPROVED |
+//                                     REJECTED | CANCELLED.
+//   - `StaffDocument`               — metadata-only document attachments;
+//                                     storage URL is opaque (file pipeline
+//                                     ships later).
+//
+// Out of scope this sprint (per plan §Context): staff portal, biometric,
+// payroll / EPF, staff attendance, file upload pipeline, AAR.
+//
+// Soft-delete (`deletedAt`) on the master `Staff` and `StaffLeave` rows
+// only — child rows cascade-delete with the parent. PII writes carry
+// `category=pii` in the audit log.
+// ---------------------------------------------------------------------------
+
+enum StaffStatus {
+  ACTIVE
+  INACTIVE
+  ON_LEAVE
+  RESIGNED
+  TERMINATED
+  RETIRED
+}
+
+enum EmploymentEvent {
+  JOINED
+  ROLE_CHANGED
+  DEPARTMENT_CHANGED
+  PROMOTED
+  DEMOTED
+  RESIGNED
+  TERMINATED
+  RETIRED
+  REJOINED
+}
+
+enum LeaveStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum LeaveType {
+  CASUAL
+  SICK
+  EARNED
+  MATERNITY
+  PATERNITY
+  UNPAID
+  OTHER
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model Staff {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Profile
+  firstName   String    @map("first_name") @db.VarChar(100)
+  lastName    String    @map("last_name") @db.VarChar(100)
+  dateOfBirth DateTime? @map("date_of_birth") @db.Date
+  gender      Gender
+  bloodGroup  String?   @map("blood_group") @db.VarChar(5)
+  photoUrl    String?   @map("photo_url") @db.VarChar(500)
+
+  // Contact
+  email          String? @db.VarChar(255)
+  phone          String  @db.VarChar(20)
+  alternatePhone String? @map("alternate_phone") @db.VarChar(20)
+
+  // Identity (PII — encrypted at rest; only *Last4 ever returned)
+  panEncrypted     String? @map("pan_encrypted") @db.Text
+  panLast4         String? @map("pan_last4") @db.Char(4)
+  aadhaarEncrypted String? @map("aadhaar_encrypted") @db.Text
+  aadhaarLast4     String? @map("aadhaar_last4") @db.Char(4)
+
+  // Address (same shape as Parent)
+  addressLine1 String  @map("address_line1") @db.VarChar(200)
+  addressLine2 String? @map("address_line2") @db.VarChar(200)
+  city         String  @db.VarChar(80)
+  state        String  @db.VarChar(80)
+  postalCode   String  @map("postal_code") @db.VarChar(20)
+  country      String  @default("IN") @db.VarChar(80)
+
+  // Employment
+  // Allocated via SequenceService.nextValue('employee') at create time.
+  // Unique within school; never reused even on staff deletion.
+  employeeCode  String      @map("employee_code") @db.VarChar(40)
+  // Free-form designation kept alongside `designationId` (Sprint 4.5) for the
+  // dual-column transition. Backfill into Designation rows is a Sprint 7
+  // concern; queries should prefer `designationId` once populated.
+  designation   String      @db.VarChar(100)
+  // Sprint 4.5 — optional FKs to organisational lookups. SetNull on the
+  // referenced row's deletion so staff outlive renamed/removed lookups.
+  departmentId  String?     @map("department_id") @db.Char(36)
+  designationId String?     @map("designation_id") @db.Char(36)
+  department    String?     @db.VarChar(100)
+  dateOfJoining DateTime    @map("date_of_joining") @db.Date
+  dateOfLeaving DateTime?   @map("date_of_leaving") @db.Date
+  status        StaffStatus @default(ACTIVE)
+
+  // Bank (optional; encrypted)
+  bankAccountEncrypted String? @map("bank_account_encrypted") @db.Text
+  bankAccountLast4     String? @map("bank_account_last4") @db.Char(4)
+  bankIfsc             String? @map("bank_ifsc") @db.VarChar(20)
+
+  // Optional link to a User row (login). Plain ID — no FK because User is
+  // platform-wide identity and crossing cluster boundaries with a hard FK
+  // adds noise. Service validates the User exists in this tenant on set.
+  userId String? @map("user_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  employmentHistory        StaffEmploymentHistory[]    @relation("StaffEmploymentHistoryEntries")
+  qualifications           StaffQualification[]        @relation("StaffQualifications")
+  subjectQualifications    StaffSubjectQualification[] @relation("StaffSubjectQualifications")
+  sectionAssignments       StaffSectionAssignment[]    @relation("StaffSectionAssignments")
+  classTeacherRoles        ClassTeacher[]              @relation("StaffClassTeacherRoles")
+  leaves                   StaffLeave[]                @relation("StaffLeaves")
+  documents                StaffDocument[]             @relation("StaffDocuments")
+  // Sprint 4.5 relations.
+  departmentRef            Department?                 @relation("StaffDepartment", fields: [schoolId, departmentId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_staff_department")
+  designationRef           Designation?                @relation("StaffDesignation", fields: [schoolId, designationId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_staff_designation")
+  managedBranches          Branch[]                    @relation("StaffManagedBranches")
+  headedDepartments        Department[]                @relation("StaffHeadedDepartments")
+  // Sprint 6 relations.
+  attendanceEntries        StaffAttendance[]           @relation("StaffAttendanceEntries")
+  // Sprint 7 relations.
+  timetableEntries         TimetableEntry[]            @relation("StaffTimetableEntries")
+  teacherLoads             TeacherLoad[]               @relation("StaffTeacherLoads")
+  teacherAvailability      TeacherAvailability[]       @relation("StaffTeacherAvailability")
+  substitutionsCovered     TimetableSubstitution[]     @relation("StaffSubstitutionsCovered")
+  // Sprint 8 relations.
+  invigilatedExamSchedules ExamSchedule[]              @relation("StaffInvigilatedExamSchedules")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, employeeCode], map: "uq_staff_school_employee_code")
+  @@index([schoolId, status], map: "ix_staff_school_status")
+  @@index([schoolId, designation], map: "ix_staff_school_designation")
+  @@index([schoolId, department], map: "ix_staff_school_department")
+  @@index([schoolId, departmentId], map: "ix_staff_school_department_id")
+  @@index([schoolId, designationId], map: "ix_staff_school_designation_id")
+  @@index([schoolId, phone], map: "ix_staff_school_phone")
+  @@index([schoolId, aadhaarLast4], map: "ix_staff_school_aadhaar_last4")
+  @@index([schoolId, panLast4], map: "ix_staff_school_pan_last4")
+  @@index([schoolId, lastName, firstName], map: "ix_staff_school_name")
+  @@map("staff")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model StaffEmploymentHistory {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+  staffId  String @map("staff_id") @db.Char(36)
+
+  event         EmploymentEvent
+  effectiveDate DateTime        @map("effective_date") @db.Date
+  // Pre/post value of whatever attribute changed (designation / department /
+  // status). Free-form string — semantics live on `event`.
+  fromValue     String?         @map("from_value") @db.VarChar(255)
+  toValue       String?         @map("to_value") @db.VarChar(255)
+  note          String?         @db.VarChar(500)
+  actorId       String?         @map("actor_id") @db.Char(36)
+  occurredAt    DateTime        @default(now()) @map("occurred_at") @db.Timestamp(3)
+
+  staff Staff @relation("StaffEmploymentHistoryEntries", fields: [schoolId, staffId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_staff_emp_history_staff")
+
+  @@id([schoolId, id])
+  @@index([schoolId, staffId, occurredAt], map: "ix_staff_emp_history_school_staff_occurred")
+  @@map("staff_employment_history")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model StaffQualification {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+  staffId  String @map("staff_id") @db.Char(36)
+
+  // DEGREE | CERTIFICATION | EXPERIENCE (free-form for now; enum upgrade
+  // when the staff portal lands in a later sprint).
+  qualificationType String  @map("qualification_type") @db.VarChar(40)
+  name              String  @db.VarChar(200)
+  institution       String? @db.VarChar(200)
+  yearAwarded       Int?    @map("year_awarded")
+  gradeOrScore      String? @map("grade_or_score") @db.VarChar(40)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+
+  staff Staff @relation("StaffQualifications", fields: [schoolId, staffId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_staff_qual_staff")
+
+  @@id([schoolId, id])
+  @@index([schoolId, staffId], map: "ix_staff_qual_school_staff")
+  @@map("staff_qualifications")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model StaffSubjectQualification {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  staffId   String @map("staff_id") @db.Char(36)
+  subjectId String @map("subject_id") @db.Char(36)
+
+  // PRIMARY | SECONDARY — teacher's relative fluency in this subject.
+  // Optional; null means "qualified, no ranking provided".
+  proficiency String? @db.VarChar(20)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+
+  staff   Staff   @relation("StaffSubjectQualifications", fields: [schoolId, staffId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_staff_subj_qual_staff")
+  subject Subject @relation("SubjectStaffQualifications", fields: [schoolId, subjectId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_staff_subj_qual_subject")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, staffId, subjectId], map: "uq_staff_subj_qual_school_staff_subject")
+  @@index([schoolId, subjectId], map: "ix_staff_subj_qual_school_subject")
+  @@map("staff_subject_qualifications")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model StaffSectionAssignment {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  staffId        String @map("staff_id") @db.Char(36)
+  sectionId      String @map("section_id") @db.Char(36)
+  subjectId      String @map("subject_id") @db.Char(36)
+  academicYearId String @map("academic_year_id") @db.Char(36)
+
+  // Optional planned weekly period count for timetabling.
+  periodsPerWeek Int? @map("periods_per_week")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+
+  staff        Staff        @relation("StaffSectionAssignments", fields: [schoolId, staffId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_staff_sec_assign_staff")
+  section      Section      @relation("SectionStaffAssignments", fields: [schoolId, sectionId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_staff_sec_assign_section")
+  subject      Subject      @relation("SubjectStaffAssignments", fields: [schoolId, subjectId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_staff_sec_assign_subject")
+  academicYear AcademicYear @relation("AcademicYearStaffAssignments", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_staff_sec_assign_year")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, academicYearId, sectionId, subjectId, staffId], map: "uq_staff_sec_assign_year_section_subject_staff")
+  @@index([schoolId, staffId], map: "ix_staff_sec_assign_school_staff")
+  @@index([schoolId, sectionId, subjectId], map: "ix_staff_sec_assign_school_section_subject")
+  @@index([schoolId, academicYearId], map: "ix_staff_sec_assign_school_year")
+  @@map("staff_section_assignments")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model ClassTeacher {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  staffId        String @map("staff_id") @db.Char(36)
+  sectionId      String @map("section_id") @db.Char(36)
+  academicYearId String @map("academic_year_id") @db.Char(36)
+
+  assignedOn DateTime  @map("assigned_on") @db.Date
+  // When set, this row no longer represents the active homeroom teacher.
+  // Service-level uniqueness check filters on `revokedOn IS NULL`.
+  revokedOn  DateTime? @map("revoked_on") @db.Date
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  staff        Staff        @relation("StaffClassTeacherRoles", fields: [schoolId, staffId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_class_teacher_staff")
+  section      Section      @relation("SectionClassTeacherRoles", fields: [schoolId, sectionId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_class_teacher_section")
+  academicYear AcademicYear @relation("AcademicYearClassTeacherRoles", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_class_teacher_year")
+
+  @@id([schoolId, id])
+  @@index([schoolId, sectionId, academicYearId, revokedOn], map: "ix_class_teacher_school_section_year_revoked")
+  @@index([schoolId, staffId], map: "ix_class_teacher_school_staff")
+  @@map("class_teachers")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model StaffLeave {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+  staffId  String @map("staff_id") @db.Char(36)
+
+  leaveType LeaveType   @map("leave_type")
+  startDate DateTime    @map("start_date") @db.Date
+  endDate   DateTime    @map("end_date") @db.Date
+  // Half-day support via `.5` increments; service validates 0 < days <= 366.
+  days      Decimal     @db.Decimal(4, 1)
+  reason    String      @db.VarChar(500)
+  status    LeaveStatus @default(DRAFT)
+
+  decidedBy    String?   @map("decided_by") @db.Char(36)
+  decidedAt    DateTime? @map("decided_at") @db.Timestamp(3)
+  decisionNote String?   @map("decision_note") @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  staff Staff @relation("StaffLeaves", fields: [schoolId, staffId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_staff_leave_staff")
+
+  @@id([schoolId, id])
+  @@index([schoolId, staffId, startDate], map: "ix_staff_leave_school_staff_start")
+  @@index([schoolId, status], map: "ix_staff_leave_school_status")
+  @@map("staff_leaves")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model StaffDocument {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+  staffId  String @map("staff_id") @db.Char(36)
+
+  label      String   @db.VarChar(120)
+  fileName   String   @map("file_name") @db.VarChar(255)
+  mimeType   String   @map("mime_type") @db.VarChar(100)
+  sizeBytes  Int      @map("size_bytes")
+  // Opaque this sprint — upload pipeline ships later.
+  storageUrl String   @map("storage_url") @db.VarChar(1000)
+  uploadedBy String?  @map("uploaded_by") @db.Char(36)
+  uploadedAt DateTime @default(now()) @map("uploaded_at") @db.Timestamp(3)
+
+  staff Staff @relation("StaffDocuments", fields: [schoolId, staffId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_staff_doc_staff")
+
+  @@id([schoolId, id])
+  @@index([schoolId, staffId], map: "ix_staff_doc_school_staff")
+  @@map("staff_documents")
+}

@@ -1,0 +1,22 @@
+node_modules
+dist
+coverage
+.env
+.env.*
+!.env.example
+.git
+.github
+.husky
+.vscode
+.idea
+*.log
+test
+**/*.spec.ts
+**/*.test.ts
+**/*.e2e-spec.ts
+.DS_Store
+Thumbs.db
+# Prisma: ship the schema folder so `prisma generate` works in the builder
+# image, but never ship a host-generated client (rebuilt in-image).
+prisma/migrations/dev.db*
+node_modules/.prisma

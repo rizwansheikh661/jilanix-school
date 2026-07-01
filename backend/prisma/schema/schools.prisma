@@ -1,0 +1,262 @@
+// ---------------------------------------------------------------------------
+// schools.prisma — School identity & branding (Sprint 4.5).
+//
+// The existing `schools` row (platform.prisma) holds the legal-tenancy core:
+// slug, legalName, country, GSTIN/PAN, contact basics, status. Sprint 4.5
+// adds three sibling tables for fields that don't belong on `schools`
+// because they're either academic identity, visual identity, or 1:N:
+//
+//   - `SchoolProfile`             — 1:1 academic identity (board, affiliation,
+//                                   medium, principal, mission/vision, area).
+//   - `SchoolBranding`            — 1:1 visual identity (logo, colours, font).
+//   - `SchoolContactInformation`  — 1:N additional contacts (multiple
+//                                   reception phones, emergency emails, etc.).
+//   - `SchoolDocuments`           — 1:N registration / affiliation / NOC
+//                                   certificates. Metadata-only this sprint.
+//
+// All four are TENANT_OWNED with composite (schoolId, id) PKs; the two 1:1
+// tables also carry `@@unique([schoolId])` to enforce single-row-per-school.
+// All four cascade-delete with the parent `schools` row.
+// ---------------------------------------------------------------------------
+
+enum SchoolBoard {
+  CBSE
+  ICSE
+  IB
+  IGCSE
+  STATE_BOARD
+  NIOS
+  OTHER
+}
+
+enum SchoolType {
+  PRIVATE
+  GOVT
+  AIDED
+  TRUST
+}
+
+enum SchoolCategory {
+  PRESCHOOL
+  PRIMARY
+  MIDDLE
+  SECONDARY
+  HIGHER_SECONDARY
+  COMPOSITE
+}
+
+enum GenderType {
+  BOYS
+  GIRLS
+  COED
+}
+
+enum ContactType {
+  PHONE
+  EMAIL
+  PERSON
+  SOCIAL
+  EMERGENCY
+}
+
+enum SchoolDocumentType {
+  REGISTRATION_CERT
+  AFFILIATION_CERT
+  NOC
+  GST_CERT
+  PAN_CERT
+  TRUST_DEED
+  SOCIETY_DEED
+  OTHER
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=tenancy
+model SchoolProfile {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Academic identity
+  board                SchoolBoard?
+  affiliationNumber    String?        @map("affiliation_number") @db.VarChar(40)
+  affiliationValidTill DateTime?      @map("affiliation_valid_till") @db.Date
+  schoolType           SchoolType     @default(PRIVATE) @map("school_type")
+  schoolCategory       SchoolCategory @default(COMPOSITE) @map("school_category")
+  genderType           GenderType     @default(COED) @map("gender_type")
+  mediumOfInstruction  String         @default("English") @map("medium_of_instruction") @db.VarChar(40)
+  establishedYear      Int?           @map("established_year")
+  registrationNumber   String?        @map("registration_number") @db.VarChar(60)
+  trustName            String?        @map("trust_name") @db.VarChar(200)
+
+  // Leadership
+  principalName  String? @map("principal_name") @db.VarChar(120)
+  principalPhone String? @map("principal_phone") @db.VarChar(20)
+  principalEmail String? @map("principal_email") @db.VarChar(255)
+
+  // Infrastructure
+  totalAreaSqft   Int? @map("total_area_sqft")
+  builtUpAreaSqft Int? @map("built_up_area_sqft")
+  studentCapacity Int? @map("student_capacity")
+
+  // Public-facing
+  motto   String? @db.VarChar(255)
+  mission String? @db.Text
+  vision  String? @db.Text
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  school School @relation("SchoolProfileSchool", fields: [schoolId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_school_profile_school")
+
+  @@id([schoolId, id])
+  @@unique([schoolId], map: "uq_school_profile_school_id")
+  @@map("school_profiles")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=tenancy
+///
+/// Sprint N3 — School Branding Foundation. The schema below is the single
+/// source of truth that the Email Design System renderer (and, later,
+/// Login pages, PDF reports, Invoices, Public Portal) reads from. Every
+/// column is OPTIONAL so a brand-new tenant can render the SchoolOS
+/// defaults until an operator fills the row in.
+///
+/// Field groupings:
+///   * Identity      — shortName, tagline.
+///   * Visual assets — logoUrl, darkLogoUrl, faviconUrl, letterheadUrl,
+///                     loginBackgroundUrl, emailBannerUrl, pdfHeaderUrl,
+///                     pdfFooterUrl.
+///   * Palette       — brandPrimaryHex / brandSecondaryHex / brandAccentHex.
+///   * Typography    — fontFamily.
+///   * Contact       — supportEmail, supportPhone, websiteUrl.
+///   * Chrome copy   — footerText, copyrightText.
+///   * Reserved      — socialLinksJson (Twitter/LinkedIn/Instagram/etc.).
+model SchoolBranding {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Identity
+  shortName String? @map("short_name") @db.VarChar(40)
+  tagline   String? @db.VarChar(255)
+
+  // Visual assets — all absolute https URLs to images/PDFs in object storage.
+  logoUrl            String? @map("logo_url") @db.VarChar(1000)
+  darkLogoUrl        String? @map("dark_logo_url") @db.VarChar(1000)
+  faviconUrl         String? @map("favicon_url") @db.VarChar(1000)
+  letterheadUrl      String? @map("letterhead_url") @db.VarChar(1000)
+  loginBackgroundUrl String? @map("login_background_url") @db.VarChar(1000)
+  emailBannerUrl     String? @map("email_banner_url") @db.VarChar(1000)
+  pdfHeaderUrl       String? @map("pdf_header_url") @db.VarChar(1000)
+  pdfFooterUrl       String? @map("pdf_footer_url") @db.VarChar(1000)
+
+  // Palette — hex colour codes, DTO validates ^#[0-9A-Fa-f]{6}$.
+  brandPrimaryHex   String? @map("brand_primary_hex") @db.Char(7)
+  brandSecondaryHex String? @map("brand_secondary_hex") @db.Char(7)
+  brandAccentHex    String? @map("brand_accent_hex") @db.Char(7)
+
+  // Typography
+  fontFamily String? @map("font_family") @db.VarChar(80)
+
+  // Contact — overrides School.email / School.phone / School.website when
+  // a tenant has dedicated support channels separate from administrative.
+  supportEmail String? @map("support_email") @db.VarChar(255)
+  supportPhone String? @map("support_phone") @db.VarChar(40)
+  websiteUrl   String? @map("website_url") @db.VarChar(500)
+
+  // Chrome copy — rendered into footers of emails/PDFs/portal.
+  footerText    String? @map("footer_text") @db.VarChar(500)
+  copyrightText String? @map("copyright_text") @db.VarChar(255)
+
+  // Reserved — { twitter, linkedin, instagram, facebook, youtube }.
+  socialLinksJson Json? @map("social_links_json")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  school School @relation("SchoolBrandingSchool", fields: [schoolId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_school_branding_school")
+
+  @@id([schoolId, id])
+  @@unique([schoolId], map: "uq_school_branding_school_id")
+  @@map("school_branding")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=tenancy
+model SchoolContactInformation {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  contactType ContactType @map("contact_type")
+  // Display label — "Reception", "Admissions Office", "Principal Direct".
+  label       String      @db.VarChar(80)
+  // The actual value — phone number, email, handle, etc. Free-form because
+  // shape varies across contact types (DTO validates per type).
+  value       String      @db.VarChar(255)
+  // Service-level rule: exactly one isPrimary=true per (schoolId, contactType).
+  // Pre-flight demote in same tx.
+  isPrimary   Boolean     @default(false) @map("is_primary")
+  sortOrder   Int         @default(0) @map("sort_order")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  school School @relation("SchoolContactSchool", fields: [schoolId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_school_contact_school")
+
+  @@id([schoolId, id])
+  @@index([schoolId, contactType], map: "ix_school_contact_school_type")
+  @@index([schoolId, contactType, isPrimary], map: "ix_school_contact_school_primary")
+  @@map("school_contact_information")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=tenancy
+model SchoolDocument {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  documentType SchoolDocumentType @map("document_type")
+  label        String             @db.VarChar(120)
+  fileName     String             @map("file_name") @db.VarChar(255)
+  mimeType     String             @map("mime_type") @db.VarChar(100)
+  sizeBytes    Int                @map("size_bytes")
+  // Opaque this sprint — file upload pipeline ships later.
+  storageUrl   String             @map("storage_url") @db.VarChar(1000)
+
+  issueDate        DateTime? @map("issue_date") @db.Date
+  expiryDate       DateTime? @map("expiry_date") @db.Date
+  issuingAuthority String?   @map("issuing_authority") @db.VarChar(200)
+  docNumber        String?   @map("doc_number") @db.VarChar(80)
+  notes            String?   @db.VarChar(500)
+
+  uploadedBy String?  @map("uploaded_by") @db.Char(36)
+  uploadedAt DateTime @default(now()) @map("uploaded_at") @db.Timestamp(3)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  school School @relation("SchoolDocumentSchool", fields: [schoolId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_school_doc_school")
+
+  @@id([schoolId, id])
+  @@index([schoolId, documentType], map: "ix_school_doc_school_type")
+  @@index([schoolId, expiryDate], map: "ix_school_doc_school_expiry")
+  @@map("school_documents")
+}

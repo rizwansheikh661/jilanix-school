@@ -1,0 +1,66 @@
+// ---------------------------------------------------------------------------
+// audit.prisma — Audit trail.
+//
+// AuditLog is append-only, partitioned monthly by `created_at` (the
+// partitioning DDL lives in a manual migration; Prisma cannot model
+// partitions natively). Hash chain columns (`prevHash`, `rowHash`) are
+// populated by the audit extension inside the same transaction as the
+// business write so a tampered row breaks the chain at verify time.
+//
+// AuditAnchor records periodic external attestations of the chain — i.e.
+// the most recent `rowHash` per (school, category, period) is shipped to
+// immutable external storage (S3 Object Lock) and the URL/ETag stored
+// here. Sprint 1 ships the schema only; the anchor job lands later.
+// ---------------------------------------------------------------------------
+
+/// @scope CROSS_TENANT_OPERATIONAL
+/// @audit immutable
+model AuditLog {
+  id                 String  @id @default(uuid()) @db.Char(36)
+  schoolId           String? @map("school_id") @db.Char(36)
+  actorUserId        String? @map("actor_user_id") @db.Char(36)
+  actorScope         String  @default("tenant") @map("actor_scope") @db.VarChar(10)
+  impersonatorUserId String? @map("impersonator_user_id") @db.Char(36)
+
+  action       String  @db.VarChar(100)
+  category     String  @default("general") @db.VarChar(20)
+  resourceType String? @map("resource_type") @db.VarChar(50)
+  resourceId   String? @map("resource_id") @db.Char(36)
+
+  // Captured by the audit extension. before/after JSON is masked for
+  // sensitive fields per the model annotation `/// @audit sensitiveFields=...`.
+  beforeJson Json? @map("before_json")
+  afterJson  Json? @map("after_json")
+
+  ipAddress String? @map("ip_address") @db.VarChar(45)
+  userAgent String? @map("user_agent") @db.Text
+  requestId String? @map("request_id") @db.Char(26)
+
+  // Hash chain. `rowHash = sha256(prevHash || canonicalize(this))`.
+  prevHash String? @map("prev_hash") @db.Char(64)
+  rowHash  String  @map("row_hash") @db.Char(64)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+
+  @@index([schoolId, createdAt(sort: Desc)], map: "ix_audit_log_school_created")
+  @@index([schoolId, resourceType, resourceId, createdAt(sort: Desc)], map: "ix_audit_log_resource")
+  @@index([actorUserId, createdAt(sort: Desc)], map: "ix_audit_log_actor")
+  @@index([category, createdAt(sort: Desc)], map: "ix_audit_log_category")
+  @@map("audit_log")
+}
+
+/// @scope CROSS_TENANT_OPERATIONAL
+model AuditAnchor {
+  id                 String   @id @default(uuid()) @db.Char(36)
+  schoolId           String?  @map("school_id") @db.Char(36)
+  category           String   @db.VarChar(20)
+  periodStart        DateTime @map("period_start") @db.Timestamp(3)
+  periodEnd          DateTime @map("period_end") @db.Timestamp(3)
+  lastRowHash        String   @map("last_row_hash") @db.Char(64)
+  externalStorageUri String?  @map("external_storage_uri") @db.VarChar(500)
+  externalObjectEtag String?  @map("external_object_etag") @db.VarChar(100)
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+
+  @@unique([schoolId, category, periodStart], map: "uq_audit_anchors_school_category_period")
+  @@map("audit_anchors")
+}

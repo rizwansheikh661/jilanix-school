@@ -1,0 +1,488 @@
+// ---------------------------------------------------------------------------
+// academic-content.prisma — Sprint 12 Homework, Assignments & Syllabus
+// Foundation.
+//
+// 8 models, all TENANT_OWNED with composite (school_id, id) PKs:
+//   - Homework                       — header + lifecycle (DRAFT →
+//                                      PUBLISHED → CLOSED; CANCELLED from any
+//                                      non-terminal). Auto-coded HW-<seq> via
+//                                      SEQ_NAMES.HOMEWORK (non-FY). Soft-delete
+//                                      + active-uniqueness via STORED on
+//                                      (school_id, code).
+//   - HomeworkAttachment             — multiple files per homework. FK to
+//                                      FileAsset is single-column (FileAsset
+//                                      has single-column PK; TENANT_SHARED_
+//                                      PLATFORM with nullable school_id).
+//                                      Cross-tenant safety enforced in service
+//                                      via assertTenantRefs.
+//   - Assignment                     — header + lifecycle (DRAFT → PUBLISHED →
+//                                      CLOSED; CANCELLED from any non-terminal).
+//                                      Auto-coded ASGN-<seq> via
+//                                      SEQ_NAMES.ASSIGNMENT (non-FY). maxMarks
+//                                      / passingMarks required (cross-field:
+//                                      passingMarks <= maxMarks). Soft-delete
+//                                      + active-uniqueness via STORED on
+//                                      (school_id, code).
+//   - AssignmentAttachment           — mirrors HomeworkAttachment.
+//   - AssignmentSubmission           — teacher-mediated per-student submission.
+//                                      isLate computed at submit (submittedAt
+//                                      >= assignment.dueDate). status:
+//                                      SUBMITTED / LATE_SUBMITTED / EVALUATED
+//                                      / REJECTED. rubricSnapshot JSON column
+//                                      reserved (null in v1; AI eval deferred).
+//                                      Soft-delete + active-uniqueness via
+//                                      STORED on (school_id, assignment_id,
+//                                      student_id) → one active submission per
+//                                      (assignment, student).
+//   - AssignmentSubmissionAttachment — files attached to a submission. FK to
+//                                      FileAsset single-column (same precedent).
+//   - Syllabus                       — container (academicYear + class +
+//                                      subject). status NOT_STARTED →
+//                                      IN_PROGRESS → COMPLETED. completion
+//                                      percent denormalized; recomputed in tx
+//                                      on node completion. Soft-delete +
+//                                      active-uniqueness via STORED on
+//                                      (school_id, academic_year_id, class_id,
+//                                      subject_id) → one active syllabus per
+//                                      (year, class, subject).
+//   - SyllabusNode                   — self-referencing tree (UNIT → CHAPTER →
+//                                      TOPIC). parentNodeId composite FK to
+//                                      SyllabusNode; null for UNIT roots.
+//                                      Hierarchy rules enforced in service.
+//                                      Completion bubbles bottom-up in the
+//                                      same tx as the leaf update.
+//
+// Doc gap (DATABASE_DESIGN.md / MODEL_INVENTORY.md have NO entries for this
+// domain) — Sprint 12 proposes the table set from scratch. Naming follows
+// Sprint 10/11 precedent: snake_case @@map identifiers, ix_<table>_<columns>
+// index naming, composite (school_id, *_id) FKs throughout.
+//
+// REST_API_DESIGN.md §6.5 deviation: routes mount at /api/v1/homework and
+// /api/v1/assignments (resource-rooted, mirrors /api/v1/events). Teacher
+// Portal surface (/api/v1/teacher/...) is deferred.
+//
+// Hand-edits required in migration.sql (Prisma can't emit STORED columns):
+//   - homeworks.deleted_at_key                      + uq_homework_code_active
+//                                                     (school_id, code,
+//                                                      deleted_at_key)
+//   - assignments.deleted_at_key                    + uq_assignment_code_active
+//                                                     (school_id, code,
+//                                                      deleted_at_key)
+//   - assignment_submissions.deleted_at_key         + uq_assignment_submission_active
+//                                                     (school_id, assignment_id,
+//                                                      student_id,
+//                                                      deleted_at_key)
+//   - syllabi.deleted_at_key                        + uq_syllabus_active
+//                                                     (school_id, academic_year_id,
+//                                                      class_id, subject_id,
+//                                                      deleted_at_key)
+//
+// Cross-sprint reuse:
+//   - Sprint 5 file-storage:    HomeworkAttachment / AssignmentAttachment /
+//                               AssignmentSubmissionAttachment FK → FileAsset.
+//                               3 new FilePurpose entries registered
+//                               (HOMEWORK_ATTACHMENT / ASSIGNMENT_ATTACHMENT
+//                               20 MiB each; ASSIGNMENT_SUBMISSION 25 MiB).
+//   - Sprint 5 sequences:       SEQ_NAMES.HOMEWORK (non-FY) → HW-<seq>;
+//                               SEQ_NAMES.ASSIGNMENT (non-FY) → ASGN-<seq>.
+//   - Sprint 10 notifications:  7 event-key catalog entries registered at
+//                               boot; HomeworkService + AssignmentService +
+//                               AssignmentSubmissionService dispatch at
+//                               lifecycle / submit / evaluate transitions
+//                               AFTER business tx commits (dispatcher opens
+//                               its own tx).
+//   - Sprint 3 academic:        academicYear / class / section / subject FKs.
+//   - Sprint 4 staff:           assignedByStaffId / ownedByStaffId /
+//                               evaluatedByStaffId FKs.
+//   - Sprint 3 students:        studentId on AssignmentSubmission FK.
+// ---------------------------------------------------------------------------
+
+enum ContentStatus {
+  DRAFT
+  PUBLISHED
+  CLOSED
+  CANCELLED
+}
+
+enum HomeworkPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum AttachmentType {
+  PDF
+  DOC
+  DOCX
+  IMAGE
+  WORKSHEET
+  NOTE
+  OTHER
+}
+
+enum SubmissionStatus {
+  SUBMITTED
+  LATE_SUBMITTED
+  EVALUATED
+  REJECTED
+}
+
+enum SyllabusStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum SyllabusNodeType {
+  UNIT
+  CHAPTER
+  TOPIC
+}
+
+enum SyllabusNodeStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_homework_code_active partial unique
+/// are added in migration.sql (Prisma can't emit GENERATED ALWAYS AS).
+model Homework {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Auto-coded HW-<seq> via TenantSequences (SEQ_NAMES.HOMEWORK, non-FY).
+  code         String  @db.VarChar(40)
+  title        String  @db.VarChar(200)
+  description  String? @db.Text
+  instructions String? @db.Text
+
+  academicYearId    String @map("academic_year_id") @db.Char(36)
+  classId           String @map("class_id") @db.Char(36)
+  sectionId         String @map("section_id") @db.Char(36)
+  subjectId         String @map("subject_id") @db.Char(36)
+  assignedByStaffId String @map("assigned_by_staff_id") @db.Char(36)
+
+  assignedDate DateTime         @map("assigned_date") @db.Date
+  dueDate      DateTime         @map("due_date") @db.Date
+  priority     HomeworkPriority @default(MEDIUM)
+
+  status      ContentStatus @default(DRAFT)
+  publishedAt DateTime?     @map("published_at") @db.Timestamp(3)
+  closedAt    DateTime?     @map("closed_at") @db.Timestamp(3)
+  cancelledAt DateTime?     @map("cancelled_at") @db.Timestamp(3)
+
+  cancellationReason String? @map("cancellation_reason") @db.VarChar(500)
+
+  // Denormalized counter — maintained inside attachment upload/delete txs
+  // with optimistic version guards.
+  attachmentCount Int @default(0) @map("attachment_count")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  attachments HomeworkAttachment[] @relation("HomeworkAttachments")
+
+  @@id([schoolId, id])
+  @@index([schoolId, status, dueDate], map: "ix_homework_school_status_due")
+  @@index([schoolId, sectionId, subjectId, dueDate], map: "ix_homework_school_section_subject_due")
+  @@index([schoolId, assignedByStaffId], map: "ix_homework_school_assigned_by")
+  @@index([schoolId, academicYearId, classId], map: "ix_homework_school_year_class")
+  @@index([schoolId, deletedAt], map: "ix_homework_deleted_at")
+  @@map("homeworks")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// FK on file_asset_id is single-column (FileAsset has a single-column PK and
+/// is TENANT_SHARED_PLATFORM with nullable school_id). Cross-tenant safety
+/// is enforced in the service layer via assertTenantRefs.
+model HomeworkAttachment {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  homeworkId  String @map("homework_id") @db.Char(36)
+  fileAssetId String @map("file_asset_id") @db.Char(36)
+
+  attachmentType    AttachmentType @map("attachment_type")
+  title             String         @db.VarChar(200)
+  uploadedByStaffId String?        @map("uploaded_by_staff_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  homework Homework @relation("HomeworkAttachments", fields: [schoolId, homeworkId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_homework_attachment_homework")
+
+  @@id([schoolId, id])
+  @@index([schoolId, homeworkId], map: "ix_homework_attachment_school_homework")
+  @@index([schoolId, fileAssetId], map: "ix_homework_attachment_school_file_asset")
+  @@index([schoolId, deletedAt], map: "ix_homework_attachment_deleted_at")
+  @@map("homework_attachments")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_assignment_code_active partial
+/// unique are added in migration.sql.
+model Assignment {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Auto-coded ASGN-<seq> via TenantSequences (SEQ_NAMES.ASSIGNMENT, non-FY).
+  code        String  @db.VarChar(40)
+  title       String  @db.VarChar(200)
+  description String? @db.Text
+
+  academicYearId    String @map("academic_year_id") @db.Char(36)
+  classId           String @map("class_id") @db.Char(36)
+  sectionId         String @map("section_id") @db.Char(36)
+  subjectId         String @map("subject_id") @db.Char(36)
+  assignedByStaffId String @map("assigned_by_staff_id") @db.Char(36)
+
+  assignedDate DateTime @map("assigned_date") @db.Date
+  dueDate      DateTime @map("due_date") @db.Date
+
+  // Cross-field at create: passingMarks <= maxMarks (service-validated).
+  maxMarks     Decimal @map("max_marks") @db.Decimal(8, 2)
+  passingMarks Decimal @map("passing_marks") @db.Decimal(8, 2)
+
+  status      ContentStatus @default(DRAFT)
+  publishedAt DateTime?     @map("published_at") @db.Timestamp(3)
+  closedAt    DateTime?     @map("closed_at") @db.Timestamp(3)
+  cancelledAt DateTime?     @map("cancelled_at") @db.Timestamp(3)
+
+  cancellationReason String? @map("cancellation_reason") @db.VarChar(500)
+
+  // Denormalized counters — maintained inside submission txs with version
+  // guards. lateCount = count of LATE_SUBMITTED across all submissions.
+  submissionCount Int @default(0) @map("submission_count")
+  evaluatedCount  Int @default(0) @map("evaluated_count")
+  lateCount       Int @default(0) @map("late_count")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  attachments AssignmentAttachment[] @relation("AssignmentAttachments")
+  submissions AssignmentSubmission[] @relation("AssignmentSubmissions")
+
+  @@id([schoolId, id])
+  @@index([schoolId, status, dueDate], map: "ix_assignment_school_status_due")
+  @@index([schoolId, sectionId, subjectId, dueDate], map: "ix_assignment_school_section_subject_due")
+  @@index([schoolId, assignedByStaffId], map: "ix_assignment_school_assigned_by")
+  @@index([schoolId, academicYearId, classId], map: "ix_assignment_school_year_class")
+  @@index([schoolId, deletedAt], map: "ix_assignment_deleted_at")
+  @@map("assignments")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model AssignmentAttachment {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  assignmentId String @map("assignment_id") @db.Char(36)
+  fileAssetId  String @map("file_asset_id") @db.Char(36)
+
+  attachmentType    AttachmentType @map("attachment_type")
+  title             String         @db.VarChar(200)
+  uploadedByStaffId String?        @map("uploaded_by_staff_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  assignment Assignment @relation("AssignmentAttachments", fields: [schoolId, assignmentId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_assignment_attachment_assignment")
+
+  @@id([schoolId, id])
+  @@index([schoolId, assignmentId], map: "ix_assignment_attachment_school_assignment")
+  @@index([schoolId, fileAssetId], map: "ix_assignment_attachment_school_file_asset")
+  @@index([schoolId, deletedAt], map: "ix_assignment_attachment_deleted_at")
+  @@map("assignment_attachments")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_assignment_submission_active partial
+/// unique are added in migration.sql (one active submission per
+/// assignment × student).
+model AssignmentSubmission {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  assignmentId String @map("assignment_id") @db.Char(36)
+  studentId    String @map("student_id") @db.Char(36)
+
+  submittedAt DateTime @default(now()) @map("submitted_at") @db.Timestamp(3)
+  // Computed at submission time: submittedAt >= assignment.dueDate.
+  // Status reflects the same signal (LATE_SUBMITTED vs SUBMITTED).
+  isLate      Boolean  @default(false) @map("is_late")
+
+  status            SubmissionStatus @default(SUBMITTED)
+  // Teacher who keyed in the submission on behalf of the student
+  // (teacher-mediated only in v1; student self-submission deferred).
+  recordedByStaffId String?          @map("recorded_by_staff_id") @db.Char(36)
+  remarks           String?          @db.VarChar(1000)
+
+  marksObtained      Decimal?  @map("marks_obtained") @db.Decimal(8, 2)
+  evaluatedAt        DateTime? @map("evaluated_at") @db.Timestamp(3)
+  evaluatedByStaffId String?   @map("evaluated_by_staff_id") @db.Char(36)
+  evaluationRemarks  String?   @map("evaluation_remarks") @db.VarChar(1000)
+
+  // Reserved for future AI / rubric evaluation engines. Null in v1.
+  rubricSnapshot Json? @map("rubric_snapshot")
+
+  rejectedAt      DateTime? @map("rejected_at") @db.Timestamp(3)
+  rejectionReason String?   @map("rejection_reason") @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  assignment  Assignment                       @relation("AssignmentSubmissions", fields: [schoolId, assignmentId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_assignment_submission_assignment")
+  attachments AssignmentSubmissionAttachment[] @relation("AssignmentSubmissionAttachments")
+
+  @@id([schoolId, id])
+  @@index([schoolId, assignmentId, status], map: "ix_assignment_submission_school_assignment_status")
+  @@index([schoolId, assignmentId, studentId], map: "ix_assignment_submission_school_assignment_student")
+  @@index([schoolId, studentId], map: "ix_assignment_submission_school_student")
+  @@index([schoolId, evaluatedByStaffId], map: "ix_assignment_submission_school_evaluated_by")
+  @@index([schoolId, deletedAt], map: "ix_assignment_submission_deleted_at")
+  @@map("assignment_submissions")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model AssignmentSubmissionAttachment {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  submissionId String @map("submission_id") @db.Char(36)
+  fileAssetId  String @map("file_asset_id") @db.Char(36)
+
+  attachmentType    AttachmentType @map("attachment_type")
+  title             String         @db.VarChar(200)
+  uploadedByStaffId String?        @map("uploaded_by_staff_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  submission AssignmentSubmission @relation("AssignmentSubmissionAttachments", fields: [schoolId, submissionId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_assignment_submission_attachment_submission")
+
+  @@id([schoolId, id])
+  @@index([schoolId, submissionId], map: "ix_assignment_submission_attachment_school_submission")
+  @@index([schoolId, fileAssetId], map: "ix_assignment_submission_attachment_school_file_asset")
+  @@index([schoolId, deletedAt], map: "ix_assignment_submission_attachment_deleted_at")
+  @@map("assignment_submission_attachments")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_syllabus_active partial unique are
+/// added in migration.sql (one active syllabus per year × class × subject).
+model Syllabus {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  academicYearId String @map("academic_year_id") @db.Char(36)
+  classId        String @map("class_id") @db.Char(36)
+  subjectId      String @map("subject_id") @db.Char(36)
+
+  status SyllabusStatus @default(NOT_STARTED)
+
+  plannedCompletionDate DateTime? @map("planned_completion_date") @db.Date
+  actualCompletionDate  DateTime? @map("actual_completion_date") @db.Date
+
+  // Denormalized — recomputed inside node-complete tx as
+  // (completedTopics / totalTopics) * 100, 2-decimal rounded.
+  completionPercent Decimal @default(0) @map("completion_percent") @db.Decimal(5, 2)
+
+  ownedByStaffId String? @map("owned_by_staff_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  nodes SyllabusNode[] @relation("SyllabusNodes")
+
+  @@id([schoolId, id])
+  @@index([schoolId, academicYearId, classId], map: "ix_syllabus_school_year_class")
+  @@index([schoolId, subjectId], map: "ix_syllabus_school_subject")
+  @@index([schoolId, ownedByStaffId], map: "ix_syllabus_school_owned_by")
+  @@index([schoolId, deletedAt], map: "ix_syllabus_deleted_at")
+  @@map("syllabi")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// Self-referencing tree. UNIT roots have parentNodeId=null; CHAPTERs hang
+/// off UNITs; TOPICs hang off CHAPTERs. Hierarchy validated in service.
+model SyllabusNode {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  syllabusId   String  @map("syllabus_id") @db.Char(36)
+  parentNodeId String? @map("parent_node_id") @db.Char(36)
+
+  nodeType SyllabusNodeType @map("node_type")
+  name     String           @db.VarChar(200)
+  // Orderable within parent (per-syllabus per-parent uniqueness not enforced
+  // at DB layer — duplicate sequence values allowed; UI sorts by sequence).
+  sequence Int
+
+  plannedCompletionDate DateTime?          @map("planned_completion_date") @db.Date
+  actualCompletionDate  DateTime?          @map("actual_completion_date") @db.Date
+  status                SyllabusNodeStatus @default(NOT_STARTED)
+  completedByStaffId    String?            @map("completed_by_staff_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  syllabus Syllabus       @relation("SyllabusNodes", fields: [schoolId, syllabusId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_syllabus_node_syllabus")
+  parent   SyllabusNode?  @relation("SyllabusNodeParent", fields: [schoolId, parentNodeId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_syllabus_node_parent")
+  children SyllabusNode[] @relation("SyllabusNodeParent")
+
+  @@id([schoolId, id])
+  @@index([schoolId, syllabusId, parentNodeId, sequence], map: "ix_syllabus_node_school_syllabus_parent_sequence")
+  @@index([schoolId, syllabusId, nodeType, status], map: "ix_syllabus_node_school_syllabus_type_status")
+  @@index([schoolId, deletedAt], map: "ix_syllabus_node_deleted_at")
+  @@map("syllabus_nodes")
+}

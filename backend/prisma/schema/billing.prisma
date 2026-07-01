@@ -1,0 +1,788 @@
+// ---------------------------------------------------------------------------
+// billing.prisma — Sprint 20 SaaS Billing Foundation.
+//
+// SCOPE: This is **SaaS Billing only** (School → Platform). It is permanently
+// separate from School Fees (Parent → School, see fees.prisma). The two
+// domains must never share tables, sequences, audit chains or services. See
+// docs/BILLING_FOUNDATION_ARCHITECTURE.md §1.
+//
+// All billing entities are PLATFORM_ONLY (single `id` PK, no composite
+// (school_id, id)) because the rows belong to *the platform*, not to the
+// school. Multi-tenant filtering is by `school_id` column only — there is no
+// per-tenant write isolation needed since billing is operated by the platform
+// team.
+//
+// 15 models:
+//   - BillingAccount               (root, one per school)
+//   - BillingProfile               (legal/billing identity)
+//   - BillingAddress               (postal/legal address)
+//   - TaxDetails                   (GSTIN/PAN per account)
+//   - Invoice                      (header)
+//   - InvoiceLine                  (line items)
+//   - Payment                      (recorded payment)
+//   - PaymentAttempt               (gateway/manual attempt history)
+//   - Refund                       (refund record)
+//   - CreditNote                   (credit note header)
+//   - Adjustment                   (credit/debit adjustment on account)
+//   - InvoiceHistory               (APPEND_ONLY status history)
+//   - BillingAudit                 (APPEND_ONLY billing-specific audit trail)
+//   - BillingSettings              (per-school billing configuration)
+//   - PaymentSourceConfiguration   (platform-managed payment sources)
+//
+// 11 enums (declared below).
+// ---------------------------------------------------------------------------
+
+// ===========================================================================
+// Enums
+// ===========================================================================
+
+/// Sprint 20 — invoice header status. FSM:
+///   DRAFT → PENDING → (PARTIALLY_PAID → )* PAID
+///   DRAFT/PENDING → VOID
+///   PAID → REFUNDED (full) | PARTIALLY_PAID (partial refund)
+///   PENDING → OVERDUE (auto via scheduler past due_date+grace)
+///   PENDING/PARTIALLY_PAID → WRITTEN_OFF (manual collections action)
+enum InvoiceStatus {
+  DRAFT
+  PENDING
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  VOID
+  REFUNDED
+  WRITTEN_OFF
+}
+
+/// Sprint 20 — discriminator on InvoiceLine. SUBSCRIPTION is the plan/cycle
+/// line; ADJUSTMENT covers prorations, manual adjustments, plan changes;
+/// TAX is a tax line (CGST/SGST/IGST); DISCOUNT is a negative-amount line.
+enum InvoiceLineType {
+  SUBSCRIPTION
+  ADJUSTMENT
+  TAX
+  DISCOUNT
+}
+
+/// Sprint 20 — how a payment was tendered. RAZORPAY = automated online via
+/// Razorpay; UPI/BANK_TRANSFER/CASH/CHEQUE/CARD = manual entry by platform
+/// admin with verification workflow.
+enum PaymentMethod {
+  RAZORPAY
+  UPI
+  BANK_TRANSFER
+  CASH
+  CHEQUE
+  CARD
+}
+
+/// Sprint 20 — payment record status. Razorpay payments land directly in
+/// APPROVED when the webhook signature verifies. Manual payments start in
+/// PENDING and require platform admin to transition.
+enum PaymentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  ON_HOLD
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+/// Sprint 20 — per-attempt status. One Payment may have many attempts
+/// (Razorpay order created → payment failed → retry). Manual payments
+/// typically have one INITIATED attempt that flips to SUCCESS on approval.
+enum PaymentAttemptStatus {
+  INITIATED
+  SUCCESS
+  FAILED
+  EXPIRED
+}
+
+/// Sprint 20 — type of payment source configured by platform admin.
+/// RAZORPAY = automated gateway with key id/secret; UPI = static UPI handle;
+/// BANK = bank account details; MANUAL = generic manual source (catch-all).
+enum PaymentSourceType {
+  RAZORPAY
+  UPI
+  BANK
+  MANUAL
+}
+
+/// Sprint 20 — refund lifecycle. PENDING = filed, awaiting platform review;
+/// APPROVED = approved but not yet processed; PROCESSED = money returned;
+/// REJECTED = denied; FAILED = gateway/manual processing failed.
+enum RefundStatus {
+  PENDING
+  APPROVED
+  PROCESSED
+  REJECTED
+  FAILED
+}
+
+/// Sprint 20 — credit note status. ISSUED is the initial state; APPLIED
+/// once consumed against a future invoice; VOID if cancelled.
+enum CreditNoteStatus {
+  ISSUED
+  APPLIED
+  VOID
+}
+
+/// Sprint 20 — adjustment direction. CREDIT reduces what the school owes
+/// (e.g. promotional credit, goodwill). DEBIT increases what the school
+/// owes (e.g. interest, fee).
+enum AdjustmentKind {
+  CREDIT
+  DEBIT
+}
+
+/// Sprint 20 — append-only invoice history actions. Records every meaningful
+/// state change on the invoice, regardless of whether it caused an FSM move.
+enum InvoiceHistoryAction {
+  CREATED
+  ISSUED
+  SENT
+  PAYMENT_RECEIVED
+  PARTIAL_PAYMENT
+  PAID
+  VOIDED
+  REFUNDED
+  PARTIALLY_REFUNDED
+  WRITTEN_OFF
+  MARKED_OVERDUE
+  ADJUSTMENT_APPLIED
+  CREDIT_NOTE_APPLIED
+}
+
+/// Sprint 20 — billing-specific audit actions. Lives alongside the global
+/// AuditService entries; this one is the chronological trail for *billing*
+/// operations (admin-facing).
+enum BillingAuditAction {
+  ACCOUNT_CREATED
+  PROFILE_UPDATED
+  ADDRESS_UPDATED
+  TAX_DETAILS_UPDATED
+  INVOICE_CREATED
+  INVOICE_ISSUED
+  INVOICE_VOIDED
+  INVOICE_WRITTEN_OFF
+  PAYMENT_RECORDED
+  PAYMENT_APPROVED
+  PAYMENT_REJECTED
+  PAYMENT_HELD
+  PAYMENT_FAILED
+  REFUND_CREATED
+  REFUND_APPROVED
+  REFUND_PROCESSED
+  REFUND_REJECTED
+  CREDIT_NOTE_ISSUED
+  CREDIT_NOTE_APPLIED
+  CREDIT_NOTE_VOIDED
+  ADJUSTMENT_APPLIED
+  SETTINGS_UPDATED
+  PAYMENT_SOURCE_CONFIGURED
+  PAYMENT_SOURCE_DISABLED
+}
+
+// ===========================================================================
+// BillingAccount — root, one per school
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=tenancy
+///
+/// Sprint 20 — single billing account per school. Holds the running balance
+/// (positive = school owes us, negative = we owe school). All invoices,
+/// payments, refunds, credit notes and adjustments hang off this row.
+model BillingAccount {
+  id             String  @id @default(uuid()) @db.Char(36)
+  schoolId       String  @unique(map: "uq_billing_accounts_school") @map("school_id") @db.Char(36)
+  accountNumber  String  @unique(map: "uq_billing_accounts_number") @map("account_number") @db.VarChar(40)
+  currency       String  @default("INR") @db.Char(3)
+  balanceDue     Decimal @default(0) @map("balance_due") @db.Decimal(14, 2)
+  creditBalance  Decimal @default(0) @map("credit_balance") @db.Decimal(14, 2)
+  totalInvoiced  Decimal @default(0) @map("total_invoiced") @db.Decimal(14, 2)
+  totalPaid      Decimal @default(0) @map("total_paid") @db.Decimal(14, 2)
+  totalRefunded  Decimal @default(0) @map("total_refunded") @db.Decimal(14, 2)
+
+  isActive       Boolean   @default(true) @map("is_active")
+  lastInvoiceAt  DateTime? @map("last_invoice_at") @db.Timestamp(3)
+  lastPaymentAt  DateTime? @map("last_payment_at") @db.Timestamp(3)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  profile      BillingProfile?
+  address      BillingAddress?
+  taxDetails   TaxDetails?
+  settings     BillingSettings?
+  invoices     Invoice[]        @relation("AccountInvoices")
+  payments     Payment[]        @relation("AccountPayments")
+  refunds      Refund[]         @relation("AccountRefunds")
+  creditNotes  CreditNote[]     @relation("AccountCreditNotes")
+  adjustments  Adjustment[]     @relation("AccountAdjustments")
+  audits       BillingAudit[]   @relation("AccountAudits")
+
+  @@index([schoolId, isActive], map: "ix_billing_accounts_school_active")
+  @@index([deletedAt], map: "ix_billing_accounts_deleted_at")
+  @@map("billing_accounts")
+}
+
+// ===========================================================================
+// BillingProfile — legal billing identity (1:1 with account)
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=tenancy
+model BillingProfile {
+  id           String  @id @default(uuid()) @db.Char(36)
+  accountId    String  @unique(map: "uq_billing_profiles_account") @map("account_id") @db.Char(36)
+  legalName    String  @map("legal_name") @db.VarChar(255)
+  displayName  String? @map("display_name") @db.VarChar(255)
+  contactName  String? @map("contact_name") @db.VarChar(255)
+  contactEmail String  @map("contact_email") @db.VarChar(255)
+  contactPhone String? @map("contact_phone") @db.VarChar(40)
+  ccEmails     String? @map("cc_emails") @db.VarChar(1000)
+  website      String? @db.VarChar(255)
+  notes        String? @db.VarChar(1000)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  account BillingAccount @relation(fields: [accountId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_billing_profiles_account")
+
+  @@map("billing_profiles")
+}
+
+// ===========================================================================
+// BillingAddress — postal/legal address (1:1 with account)
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=tenancy
+model BillingAddress {
+  id           String  @id @default(uuid()) @db.Char(36)
+  accountId    String  @unique(map: "uq_billing_addresses_account") @map("account_id") @db.Char(36)
+  addressLine1 String  @map("address_line1") @db.VarChar(255)
+  addressLine2 String? @map("address_line2") @db.VarChar(255)
+  city         String  @db.VarChar(100)
+  stateCode    String  @map("state_code") @db.VarChar(10)
+  stateName    String  @map("state_name") @db.VarChar(100)
+  pincode      String  @db.VarChar(10)
+  countryCode  String  @default("IN") @map("country_code") @db.Char(2)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  account BillingAccount @relation(fields: [accountId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_billing_addresses_account")
+
+  @@map("billing_addresses")
+}
+
+// ===========================================================================
+// TaxDetails — GSTIN/PAN (1:1 with account)
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=tenancy
+model TaxDetails {
+  id         String  @id @default(uuid()) @db.Char(36)
+  accountId  String  @unique(map: "uq_tax_details_account") @map("account_id") @db.Char(36)
+  gstin      String? @db.VarChar(15)
+  pan        String? @db.VarChar(10)
+  // Whether the school's place of supply is intra-state (CGST+SGST) or
+  // inter-state (IGST). Determined relative to the platform's state code,
+  // which lives in BillingSettings.
+  placeOfSupply String? @map("place_of_supply") @db.VarChar(10)
+  taxExempt     Boolean @default(false) @map("tax_exempt")
+  exemptReason  String? @map("exempt_reason") @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  account BillingAccount @relation(fields: [accountId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_tax_details_account")
+
+  @@map("billing_tax_details")
+}
+
+// ===========================================================================
+// Invoice — header
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=finance
+///
+/// Sprint 20 — invoice header. `invoiceNumber` is per-school fiscal-year
+/// scoped via the BILLING_INVOICE sequence (e.g. `INV-2627-000001`). The
+/// snapshot JSON columns preserve the billing profile/address/tax at issue
+/// time so historical invoices remain accurate even after profile edits.
+model Invoice {
+  id             String        @id @default(uuid()) @db.Char(36)
+  accountId      String        @map("account_id") @db.Char(36)
+  schoolId       String        @map("school_id") @db.Char(36)
+  invoiceNumber  String        @unique(map: "uq_invoices_number") @map("invoice_number") @db.VarChar(60)
+  status         InvoiceStatus @default(DRAFT)
+  fiscalYear     String        @map("fiscal_year") @db.VarChar(7)
+  subscriptionId String?       @map("subscription_id") @db.Char(36)
+  billingCycle   String?       @map("billing_cycle") @db.VarChar(20)
+  periodStart    DateTime?     @map("period_start") @db.Timestamp(3)
+  periodEnd      DateTime?     @map("period_end") @db.Timestamp(3)
+
+  issuedAt   DateTime? @map("issued_at") @db.Timestamp(3)
+  dueDate    DateTime? @map("due_date") @db.Timestamp(3)
+  paidAt     DateTime? @map("paid_at") @db.Timestamp(3)
+  voidedAt   DateTime? @map("voided_at") @db.Timestamp(3)
+  voidReason String?   @map("void_reason") @db.VarChar(500)
+
+  currency       String  @default("INR") @db.Char(3)
+  subtotal       Decimal @default(0) @db.Decimal(14, 2)
+  discountTotal  Decimal @default(0) @map("discount_total") @db.Decimal(14, 2)
+  taxTotal       Decimal @default(0) @map("tax_total") @db.Decimal(14, 2)
+  totalAmount    Decimal @default(0) @map("total_amount") @db.Decimal(14, 2)
+  amountPaid     Decimal @default(0) @map("amount_paid") @db.Decimal(14, 2)
+  amountRefunded Decimal @default(0) @map("amount_refunded") @db.Decimal(14, 2)
+  amountDue      Decimal @default(0) @map("amount_due") @db.Decimal(14, 2)
+
+  // Snapshot JSON taken at issue time (profile, address, tax). Captured so
+  // re-rendering an old invoice always shows the legal/tax data that was
+  // in force the moment it was issued.
+  profileSnapshot Json? @map("profile_snapshot")
+  addressSnapshot Json? @map("address_snapshot")
+  taxSnapshot     Json? @map("tax_snapshot")
+  notes           String? @db.VarChar(1000)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  account     BillingAccount   @relation("AccountInvoices", fields: [accountId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "fk_invoices_account")
+  lines       InvoiceLine[]    @relation("InvoiceLines")
+  payments    Payment[]        @relation("InvoicePayments")
+  refunds     Refund[]         @relation("InvoiceRefunds")
+  creditNotes CreditNote[]     @relation("InvoiceCreditNotes")
+  history     InvoiceHistory[] @relation("InvoiceHistoryEntries")
+
+  @@index([schoolId, status, dueDate], map: "ix_invoices_school_status_due")
+  @@index([accountId, status], map: "ix_invoices_account_status")
+  @@index([status, dueDate], map: "ix_invoices_status_due")
+  @@index([fiscalYear], map: "ix_invoices_fiscal_year")
+  @@index([subscriptionId], map: "ix_invoices_subscription")
+  @@index([deletedAt], map: "ix_invoices_deleted_at")
+  @@map("billing_invoices")
+}
+
+// ===========================================================================
+// InvoiceLine — line items
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @audit category=finance
+model InvoiceLine {
+  id          String          @id @default(uuid()) @db.Char(36)
+  invoiceId   String          @map("invoice_id") @db.Char(36)
+  lineType    InvoiceLineType @map("line_type")
+  description String          @db.VarChar(500)
+  quantity    Decimal         @default(1) @db.Decimal(10, 2)
+  unitPrice   Decimal         @default(0) @map("unit_price") @db.Decimal(14, 2)
+  amount      Decimal         @default(0) @db.Decimal(14, 2)
+  taxCode     String?         @map("tax_code") @db.VarChar(20)
+  taxRate     Decimal?        @map("tax_rate") @db.Decimal(5, 2)
+  taxAmount   Decimal         @default(0) @map("tax_amount") @db.Decimal(14, 2)
+  metadata    Json?
+
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+
+  invoice Invoice @relation("InvoiceLines", fields: [invoiceId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_invoice_lines_invoice")
+
+  @@index([invoiceId, sortOrder], map: "ix_invoice_lines_invoice")
+  @@map("billing_invoice_lines")
+}
+
+// ===========================================================================
+// Payment — recorded payment
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=finance
+///
+/// Sprint 20 — one recorded payment. RAZORPAY payments are auto-approved
+/// when the webhook signature verifies. Manual payments (UPI/BANK/CASH/
+/// CHEQUE/CARD) land in PENDING; platform admin transitions to APPROVED /
+/// REJECTED / ON_HOLD.
+model Payment {
+  id             String        @id @default(uuid()) @db.Char(36)
+  accountId      String        @map("account_id") @db.Char(36)
+  invoiceId      String?       @map("invoice_id") @db.Char(36)
+  schoolId       String        @map("school_id") @db.Char(36)
+  receiptNumber  String        @unique(map: "uq_payments_receipt") @map("receipt_number") @db.VarChar(60)
+  method         PaymentMethod
+  status         PaymentStatus @default(PENDING)
+  currency       String        @default("INR") @db.Char(3)
+  amount         Decimal       @default(0) @db.Decimal(14, 2)
+  amountRefunded Decimal       @default(0) @map("amount_refunded") @db.Decimal(14, 2)
+  feeAmount      Decimal       @default(0) @map("fee_amount") @db.Decimal(14, 2)
+  netAmount      Decimal       @default(0) @map("net_amount") @db.Decimal(14, 2)
+  fiscalYear     String        @map("fiscal_year") @db.VarChar(7)
+
+  // Razorpay
+  gatewayOrderId   String? @map("gateway_order_id") @db.VarChar(60)
+  gatewayPaymentId String? @map("gateway_payment_id") @db.VarChar(60)
+  gatewaySignature String? @map("gateway_signature") @db.VarChar(255)
+
+  // Manual entry — UPI handle, bank ref, cheque no, etc.
+  externalReference String? @map("external_reference") @db.VarChar(255)
+  proofUrl          String? @map("proof_url") @db.VarChar(500)
+  payerNotes        String? @map("payer_notes") @db.VarChar(1000)
+
+  receivedAt  DateTime? @map("received_at") @db.Timestamp(3)
+  approvedAt  DateTime? @map("approved_at") @db.Timestamp(3)
+  approvedBy  String?   @map("approved_by") @db.Char(36)
+  rejectedAt  DateTime? @map("rejected_at") @db.Timestamp(3)
+  rejectedBy  String?   @map("rejected_by") @db.Char(36)
+  rejectionReason String? @map("rejection_reason") @db.VarChar(500)
+  holdReason  String?   @map("hold_reason") @db.VarChar(500)
+  paymentSourceId String? @map("payment_source_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  account  BillingAccount   @relation("AccountPayments", fields: [accountId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "fk_payments_account")
+  invoice  Invoice?         @relation("InvoicePayments", fields: [invoiceId], references: [id], onDelete: SetNull, onUpdate: Restrict, map: "fk_payments_invoice")
+  attempts PaymentAttempt[] @relation("PaymentAttempts")
+  refunds  Refund[]         @relation("PaymentRefunds")
+
+  @@index([schoolId, status, createdAt], map: "ix_payments_school_status_created")
+  @@index([accountId, status], map: "ix_payments_account_status")
+  @@index([invoiceId, status], map: "ix_payments_invoice_status")
+  @@index([gatewayOrderId], map: "ix_payments_gateway_order")
+  @@index([gatewayPaymentId], map: "ix_payments_gateway_payment")
+  @@index([deletedAt], map: "ix_payments_deleted_at")
+  @@map("billing_payments")
+}
+
+// ===========================================================================
+// PaymentAttempt — APPEND_ONLY attempt history
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @audit immutable
+model PaymentAttempt {
+  id        String               @id @default(uuid()) @db.Char(36)
+  paymentId String               @map("payment_id") @db.Char(36)
+  status    PaymentAttemptStatus
+  amount    Decimal              @db.Decimal(14, 2)
+
+  gatewayOrderId   String? @map("gateway_order_id") @db.VarChar(60)
+  gatewayPaymentId String? @map("gateway_payment_id") @db.VarChar(60)
+  errorCode        String? @map("error_code") @db.VarChar(80)
+  errorMessage     String? @map("error_message") @db.VarChar(1000)
+  rawResponse      Json?   @map("raw_response")
+
+  attemptedAt DateTime @default(now()) @map("attempted_at") @db.Timestamp(3)
+
+  payment Payment @relation("PaymentAttempts", fields: [paymentId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_payment_attempts_payment")
+
+  @@index([paymentId, attemptedAt], map: "ix_payment_attempts_payment")
+  @@map("billing_payment_attempts")
+}
+
+// ===========================================================================
+// Refund — refund record
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=finance
+model Refund {
+  id          String       @id @default(uuid()) @db.Char(36)
+  accountId   String       @map("account_id") @db.Char(36)
+  invoiceId   String?      @map("invoice_id") @db.Char(36)
+  paymentId   String       @map("payment_id") @db.Char(36)
+  schoolId    String       @map("school_id") @db.Char(36)
+  refundNumber String      @unique(map: "uq_refunds_number") @map("refund_number") @db.VarChar(60)
+  status      RefundStatus @default(PENDING)
+  currency    String       @default("INR") @db.Char(3)
+  amount      Decimal      @db.Decimal(14, 2)
+  reason      String       @db.VarChar(500)
+
+  approvedAt   DateTime? @map("approved_at") @db.Timestamp(3)
+  approvedBy   String?   @map("approved_by") @db.Char(36)
+  rejectedAt   DateTime? @map("rejected_at") @db.Timestamp(3)
+  rejectedBy   String?   @map("rejected_by") @db.Char(36)
+  rejectionReason String? @map("rejection_reason") @db.VarChar(500)
+  processedAt  DateTime? @map("processed_at") @db.Timestamp(3)
+  processedBy  String?   @map("processed_by") @db.Char(36)
+  gatewayRefundId String? @map("gateway_refund_id") @db.VarChar(60)
+  externalReference String? @map("external_reference") @db.VarChar(255)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  account BillingAccount @relation("AccountRefunds", fields: [accountId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "fk_refunds_account")
+  invoice Invoice?       @relation("InvoiceRefunds", fields: [invoiceId], references: [id], onDelete: SetNull, onUpdate: Restrict, map: "fk_refunds_invoice")
+  payment Payment        @relation("PaymentRefunds", fields: [paymentId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "fk_refunds_payment")
+
+  @@index([schoolId, status, createdAt], map: "ix_refunds_school_status_created")
+  @@index([paymentId], map: "ix_refunds_payment")
+  @@index([invoiceId], map: "ix_refunds_invoice")
+  @@index([deletedAt], map: "ix_refunds_deleted_at")
+  @@map("billing_refunds")
+}
+
+// ===========================================================================
+// CreditNote — credit note
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=finance
+model CreditNote {
+  id               String           @id @default(uuid()) @db.Char(36)
+  accountId        String           @map("account_id") @db.Char(36)
+  invoiceId        String?          @map("invoice_id") @db.Char(36)
+  schoolId         String           @map("school_id") @db.Char(36)
+  creditNoteNumber String           @unique(map: "uq_credit_notes_number") @map("credit_note_number") @db.VarChar(60)
+  status           CreditNoteStatus @default(ISSUED)
+  currency         String           @default("INR") @db.Char(3)
+  amount           Decimal          @db.Decimal(14, 2)
+  amountApplied    Decimal          @default(0) @map("amount_applied") @db.Decimal(14, 2)
+  reason           String           @db.VarChar(500)
+  fiscalYear       String           @map("fiscal_year") @db.VarChar(7)
+
+  appliedAt        DateTime? @map("applied_at") @db.Timestamp(3)
+  appliedToInvoiceId String? @map("applied_to_invoice_id") @db.Char(36)
+  voidedAt         DateTime? @map("voided_at") @db.Timestamp(3)
+  voidReason       String?   @map("void_reason") @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  account BillingAccount @relation("AccountCreditNotes", fields: [accountId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "fk_credit_notes_account")
+  invoice Invoice?       @relation("InvoiceCreditNotes", fields: [invoiceId], references: [id], onDelete: SetNull, onUpdate: Restrict, map: "fk_credit_notes_invoice")
+
+  @@index([schoolId, status, createdAt], map: "ix_credit_notes_school_status_created")
+  @@index([invoiceId], map: "ix_credit_notes_invoice")
+  @@index([deletedAt], map: "ix_credit_notes_deleted_at")
+  @@map("billing_credit_notes")
+}
+
+// ===========================================================================
+// Adjustment — manual credit/debit on account
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=finance
+model Adjustment {
+  id        String         @id @default(uuid()) @db.Char(36)
+  accountId String         @map("account_id") @db.Char(36)
+  invoiceId String?        @map("invoice_id") @db.Char(36)
+  schoolId  String         @map("school_id") @db.Char(36)
+  kind      AdjustmentKind
+  currency  String         @default("INR") @db.Char(3)
+  amount    Decimal        @db.Decimal(14, 2)
+  reason    String         @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  account BillingAccount @relation("AccountAdjustments", fields: [accountId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "fk_adjustments_account")
+
+  @@index([schoolId, createdAt], map: "ix_adjustments_school_created")
+  @@index([accountId, kind], map: "ix_adjustments_account_kind")
+  @@index([invoiceId], map: "ix_adjustments_invoice")
+  @@index([deletedAt], map: "ix_adjustments_deleted_at")
+  @@map("billing_adjustments")
+}
+
+// ===========================================================================
+// InvoiceHistory — APPEND_ONLY status / event history per invoice
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @audit immutable
+model InvoiceHistory {
+  id          String               @id @default(uuid()) @db.Char(36)
+  invoiceId   String               @map("invoice_id") @db.Char(36)
+  schoolId    String               @map("school_id") @db.Char(36)
+  action      InvoiceHistoryAction
+  fromStatus  String?              @map("from_status") @db.VarChar(20)
+  toStatus    String?              @map("to_status") @db.VarChar(20)
+  amount      Decimal?             @db.Decimal(14, 2)
+  notes       String?              @db.VarChar(1000)
+  actorUserId String?              @map("actor_user_id") @db.Char(36)
+  metadata    Json?
+  occurredAt  DateTime             @default(now()) @map("occurred_at") @db.Timestamp(3)
+
+  invoice Invoice @relation("InvoiceHistoryEntries", fields: [invoiceId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_invoice_history_invoice")
+
+  @@index([invoiceId, occurredAt], map: "ix_invoice_history_invoice")
+  @@index([schoolId, action, occurredAt], map: "ix_invoice_history_school_action")
+  @@map("billing_invoice_history")
+}
+
+// ===========================================================================
+// BillingAudit — APPEND_ONLY billing-specific audit trail
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @audit immutable
+model BillingAudit {
+  id          String             @id @default(uuid()) @db.Char(36)
+  accountId   String?            @map("account_id") @db.Char(36)
+  schoolId    String             @map("school_id") @db.Char(36)
+  action      BillingAuditAction
+  resourceType String?           @map("resource_type") @db.VarChar(40)
+  resourceId  String?            @map("resource_id") @db.Char(36)
+  actorUserId String?            @map("actor_user_id") @db.Char(36)
+  summary     String?            @db.VarChar(500)
+  metadata    Json?
+  occurredAt  DateTime           @default(now()) @map("occurred_at") @db.Timestamp(3)
+
+  account BillingAccount? @relation("AccountAudits", fields: [accountId], references: [id], onDelete: SetNull, onUpdate: Restrict, map: "fk_billing_audits_account")
+
+  @@index([schoolId, action, occurredAt], map: "ix_billing_audits_school_action")
+  @@index([accountId, occurredAt], map: "ix_billing_audits_account")
+  @@index([resourceType, resourceId], map: "ix_billing_audits_resource")
+  @@map("billing_audits")
+}
+
+// ===========================================================================
+// BillingSettings — per-school billing configuration (1:1 with account)
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=tenancy
+///
+/// Sprint 20 — per-school billing settings. Where Plan-level grace period
+/// would belong but doesn't (Plan has no gracePeriodDays column), this row
+/// carries it per-school. Sprint 20 default = 7 days.
+model BillingSettings {
+  id                 String  @id @default(uuid()) @db.Char(36)
+  accountId          String  @unique(map: "uq_billing_settings_account") @map("account_id") @db.Char(36)
+  schoolId           String  @unique(map: "uq_billing_settings_school") @map("school_id") @db.Char(36)
+  gracePeriodDays    Int     @default(7) @map("grace_period_days")
+  billingLeadDays    Int     @default(7) @map("billing_lead_days")
+  autoChargeEnabled  Boolean @default(false) @map("auto_charge_enabled")
+  defaultPaymentSourceId String? @map("default_payment_source_id") @db.Char(36)
+  invoicePrefix      String? @map("invoice_prefix") @db.VarChar(10)
+  remindersEnabled   Boolean @default(true) @map("reminders_enabled")
+  reminderOffsetsJson Json?  @map("reminder_offsets_json")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  account BillingAccount @relation(fields: [accountId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_billing_settings_account")
+
+  @@map("billing_settings")
+}
+
+// ===========================================================================
+// PaymentSourceConfiguration — platform-managed payment sources
+// ===========================================================================
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=security
+///
+/// Sprint 20 — payment sources configured by platform admin. RAZORPAY rows
+/// carry encrypted keyId/keySecret/webhookSecret. UPI/BANK rows carry
+/// human-readable handle/account details. `priority` orders sources for
+/// display; `isActive` gates inclusion in payment options.
+///
+/// SECURITY: `keySecret` and `webhookSecret` are stored encrypted using
+/// the CryptoModule's symmetric envelope. Repository decrypts only when
+/// needed for signing/verification.
+model PaymentSourceConfiguration {
+  id          String            @id @default(uuid()) @db.Char(36)
+  sourceType  PaymentSourceType @map("source_type")
+  name        String            @db.VarChar(120)
+  description String?           @db.VarChar(500)
+  isActive    Boolean           @default(true) @map("is_active")
+  isDefault   Boolean           @default(false) @map("is_default")
+  priority    Int               @default(0)
+
+  // Razorpay
+  razorpayKeyId          String? @map("razorpay_key_id") @db.VarChar(80)
+  razorpayKeySecretEnc   String? @map("razorpay_key_secret_enc") @db.VarChar(500)
+  razorpayWebhookSecretEnc String? @map("razorpay_webhook_secret_enc") @db.VarChar(500)
+
+  // Manual sources
+  upiHandle      String? @map("upi_handle") @db.VarChar(120)
+  bankName       String? @map("bank_name") @db.VarChar(120)
+  bankAccountNumber String? @map("bank_account_number") @db.VarChar(40)
+  bankIfsc       String? @map("bank_ifsc") @db.VarChar(20)
+  bankBranch     String? @map("bank_branch") @db.VarChar(120)
+  bankAccountHolder String? @map("bank_account_holder") @db.VarChar(120)
+  instructions   String? @db.VarChar(1000)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  @@index([sourceType, isActive, priority], map: "ix_payment_sources_type_active")
+  @@index([isActive, isDefault], map: "ix_payment_sources_active_default")
+  @@index([deletedAt], map: "ix_payment_sources_deleted_at")
+  @@map("billing_payment_sources")
+}

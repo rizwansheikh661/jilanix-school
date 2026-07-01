@@ -1,0 +1,359 @@
+// ---------------------------------------------------------------------------
+// academic.prisma — Academic Foundation domain.
+//
+// Sprint 2 scope (DATABASE_DESIGN §7.2.6 + §7.8):
+//   - `AcademicYear` — a named school year window (start..end). One year per
+//                      school may be marked current; the "single current"
+//                      invariant is enforced atomically in the service layer
+//                      because MySQL has no partial unique index.
+//   - `Class`        — a grade / level the school teaches (e.g. "Grade 5").
+//                      Sections live under a Class.
+//   - `Section`      — a divisible cohort within a Class (e.g. "A", "B").
+//                      Optionally bound to a class teacher (User FK).
+//   - `Subject`      — a subject offered by the school. Not yet linked to
+//                      classes (ClassSubject join is a follow-up story).
+//
+// Out of scope this sprint: AcademicTerm, ClassSubject, Holiday, Event,
+// Timetable. Students/Parents/Attendance/Fees explicitly deferred to later
+// sprints — Academic Foundation is the prerequisite, not the consumer.
+//
+// All models TENANT_OWNED with composite `(school_id, id)` PKs and composite
+// FKs so the tenant scope is enforced at the FK layer for cross-model joins.
+// Soft delete via `deletedAt`; the softDeleteExt rewrites `delete*` calls
+// into update + filter so existing queries see live rows only.
+// ---------------------------------------------------------------------------
+
+enum SubjectType {
+  CORE
+  ELECTIVE
+  LANGUAGE
+  OTHER
+}
+
+enum SectionSubjectMode {
+  ADD
+  REMOVE
+  REPLACE
+}
+
+enum PromotionStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=academic
+model AcademicYear {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  name      String   @db.VarChar(100)
+  startDate DateTime @map("start_date") @db.Date
+  endDate   DateTime @map("end_date") @db.Date
+  // "Single current per school" — enforced in AcademicYearService.activate.
+  // MySQL lacks partial unique indexes, so the constraint cannot live here.
+  isCurrent Boolean  @default(false) @map("is_current")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  version   Int       @default(1)
+
+  students            Student[]                @relation("AcademicYearStudents")
+  terms               AcademicTerm[]           @relation("AcademicYearTerms")
+  staffAssignments    StaffSectionAssignment[] @relation("AcademicYearStaffAssignments")
+  classTeacherRoles   ClassTeacher[]           @relation("AcademicYearClassTeacherRoles")
+  sourcePromotions    AcademicYearPromotion[]  @relation("PromotionSourceYear")
+  targetPromotions    AcademicYearPromotion[]  @relation("PromotionTargetYear")
+  // Sprint 4.5 relations.
+  houseAssignments    HouseAssignment[]        @relation("AcademicYearHouseAssignments")
+  calendarEvents      CalendarEvent[]          @relation("AcademicYearCalendarEvents")
+  // Sprint 6 relations.
+  attendanceDaily     AttendanceDaily[]        @relation("AcademicYearAttendanceDaily")
+  // Sprint 7 relations.
+  periodTemplates     PeriodTemplate[]         @relation("AcademicYearPeriodTemplates")
+  timetableVersions   TimetableVersion[]       @relation("AcademicYearTimetableVersions")
+  teacherAvailability TeacherAvailability[]    @relation("AcademicYearTeacherAvailability")
+  // Sprint 8 relations.
+  exams               Exam[]                   @relation("AcademicYearExams")
+  // Sprint 9 relations.
+  feeStructures       FeeStructure[]           @relation("AcademicYearFeeStructures")
+  feeInvoices         FeeInvoice[]             @relation("AcademicYearFeeInvoices")
+  studentFeeDiscounts StudentFeeDiscount[]     @relation("AcademicYearStudentFeeDiscounts")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, name], map: "uq_academic_years_school_name")
+  @@index([schoolId, startDate], map: "ix_academic_years_school_start")
+  @@index([schoolId, isCurrent], map: "ix_academic_years_school_current")
+  @@map("academic_years")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=academic
+model Class {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Display name — "Grade 5", "Class X", "Nursery". Free-form within school.
+  name         String @db.VarChar(60)
+  // Numeric ordering for sorting / progression (1..12 in most boards;
+  // pre-primary classes use 0 or negative). Not a unique key.
+  gradeLevel   Int    @map("grade_level")
+  // Tiebreaker when two classes share `gradeLevel` (e.g. "5-A stream"
+  // versus "5-B stream"). Default 0 — most schools won't set it.
+  displayOrder Int    @default(0) @map("display_order")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  version   Int       @default(1)
+
+  sections      Section[]
+  students      Student[]      @relation("ClassStudents")
+  classSubjects ClassSubject[] @relation("ClassClassSubjects")
+  // Sprint 8 relations.
+  examClassMaps ExamClassMap[] @relation("ClassExamMaps")
+  // Sprint 9 relations.
+  feeStructures FeeStructure[] @relation("ClassFeeStructures")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, name], map: "uq_classes_school_name")
+  @@index([schoolId, gradeLevel], map: "ix_classes_school_grade")
+  @@map("classes")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=academic
+model Section {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+  classId  String @map("class_id") @db.Char(36)
+
+  // Short label — "A", "B", "Blue". Unique within (school, class).
+  name           String  @db.VarChar(20)
+  // Soft cap on student count; null means "no enforcement at this layer".
+  capacity       Int?
+  // Optional class teacher — a User on the same school. onDelete: Restrict
+  // so a teacher who is currently assigned to any section cannot be deleted
+  // until they are first unassigned (call SectionService.assignClassTeacher
+  // with teacherId=null).
+  classTeacherId String? @map("class_teacher_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  version   Int       @default(1)
+
+  class        Class @relation(fields: [schoolId, classId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_sections_class")
+  classTeacher User? @relation("SectionClassTeacher", fields: [schoolId, classTeacherId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_sections_class_teacher")
+
+  students          Student[]                @relation("SectionStudents")
+  sectionSubjects   SectionSubject[]         @relation("SectionSectionSubjects")
+  staffAssignments  StaffSectionAssignment[] @relation("SectionStaffAssignments")
+  classTeacherRoles ClassTeacher[]           @relation("SectionClassTeacherRoles")
+  // Sprint 6 relations.
+  attendanceDaily   AttendanceDaily[]        @relation("SectionAttendanceDaily")
+  attendanceLocks   AttendanceLockWindow[]   @relation("SectionAttendanceLocks")
+  // Sprint 7 relations.
+  timetableEntries  TimetableEntry[]         @relation("SectionTimetableEntries")
+  // Sprint 8 relations.
+  examSectionMaps   ExamSectionMap[]         @relation("SectionExamMaps")
+  examSchedules     ExamSchedule[]           @relation("SectionExamSchedules")
+  examMarks         ExamMarks[]              @relation("SectionExamMarks")
+  examResults       ExamResult[]             @relation("SectionExamResults")
+  // Sprint 9 relations.
+  feeStructures     FeeStructure[]           @relation("SectionFeeStructures")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, classId, name], map: "uq_sections_school_class_name")
+  @@index([schoolId, classId], map: "ix_sections_school_class")
+  @@index([schoolId, classTeacherId], map: "ix_sections_school_teacher")
+  @@map("sections")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=academic
+model Subject {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Human-readable — "Mathematics", "English Literature".
+  name String      @db.VarChar(100)
+  // Stable short code — "MATH", "ENG-LIT". Unique within school.
+  code String      @db.VarChar(20)
+  type SubjectType @default(CORE)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  version   Int       @default(1)
+
+  classSubjects         ClassSubject[]              @relation("SubjectClassSubjects")
+  sectionSubjects       SectionSubject[]            @relation("SubjectSectionSubjects")
+  sectionSubjectsAsRepl SectionSubject[]            @relation("SubjectSectionSubjectReplacements")
+  staffQualifications   StaffSubjectQualification[] @relation("SubjectStaffQualifications")
+  staffAssignments      StaffSectionAssignment[]    @relation("SubjectStaffAssignments")
+  // Sprint 7 relations.
+  timetableEntries      TimetableEntry[]            @relation("SubjectTimetableEntries")
+  // Sprint 8 relations.
+  examSchedules         ExamSchedule[]              @relation("SubjectExamSchedules")
+  examMarks             ExamMarks[]                 @relation("SubjectExamMarks")
+  examSubjectResults    ExamSubjectResult[]         @relation("SubjectExamSubjectResults")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, code], map: "uq_subjects_school_code")
+  @@index([schoolId, type], map: "ix_subjects_school_type")
+  @@index([schoolId, name], map: "ix_subjects_school_name")
+  @@map("subjects")
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 4 additions — academic completeness.
+// ---------------------------------------------------------------------------
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model AcademicTerm {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  academicYearId String @map("academic_year_id") @db.Char(36)
+
+  // Display name — "Term 1", "Semester 2", "Q4".
+  name     String @db.VarChar(100)
+  // 1-based ordinal within the year. Service enforces monotonic uniqueness.
+  sequence Int
+
+  startDate DateTime @map("start_date") @db.Date
+  endDate   DateTime @map("end_date") @db.Date
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  academicYear AcademicYear @relation("AcademicYearTerms", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_academic_term_year")
+
+  // Sprint 8 relations.
+  exams Exam[] @relation("AcademicTermExams")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, academicYearId, sequence], map: "uq_academic_term_year_sequence")
+  @@unique([schoolId, academicYearId, name], map: "uq_academic_term_year_name")
+  @@index([schoolId, academicYearId, startDate], map: "ix_academic_term_school_year_start")
+  @@map("academic_terms")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model ClassSubject {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  classId   String @map("class_id") @db.Char(36)
+  subjectId String @map("subject_id") @db.Char(36)
+
+  // Optional electives don't count towards required-pass logic on report cards.
+  isOptional    Boolean @default(false) @map("is_optional")
+  // Hint for timetabling — actual periods can be overridden per section via
+  // StaffSectionAssignment.periodsPerWeek.
+  weeklyPeriods Int?    @map("weekly_periods")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  class   Class   @relation("ClassClassSubjects", fields: [schoolId, classId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_class_subject_class")
+  subject Subject @relation("SubjectClassSubjects", fields: [schoolId, subjectId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_class_subject_subject")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, classId, subjectId], map: "uq_class_subject_class_subject")
+  @@index([schoolId, subjectId], map: "ix_class_subject_school_subject")
+  @@map("class_subjects")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model SectionSubject {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  sectionId String @map("section_id") @db.Char(36)
+  subjectId String @map("subject_id") @db.Char(36)
+
+  // ADD     — extra subject not in the parent Class's defaults.
+  // REMOVE  — drop a subject inherited from the Class.
+  // REPLACE — swap one Class-default subject for this one (see replacesSubjectId).
+  mode SectionSubjectMode
+
+  // Only meaningful when mode = REPLACE. The Class-default subject being
+  // swapped out. Validator (service) enforces presence + ClassSubject match.
+  replacesSubjectId String? @map("replaces_subject_id") @db.Char(36)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  section         Section  @relation("SectionSectionSubjects", fields: [schoolId, sectionId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_section_subject_section")
+  subject         Subject  @relation("SubjectSectionSubjects", fields: [schoolId, subjectId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_section_subject_subject")
+  replacesSubject Subject? @relation("SubjectSectionSubjectReplacements", fields: [schoolId, replacesSubjectId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_section_subject_replaces")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, sectionId, subjectId], map: "uq_section_subject_section_subject")
+  @@index([schoolId, sectionId], map: "ix_section_subject_school_section")
+  @@map("section_subjects")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model AcademicYearPromotion {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  sourceAcademicYearId String @map("source_academic_year_id") @db.Char(36)
+  targetAcademicYearId String @map("target_academic_year_id") @db.Char(36)
+
+  status PromotionStatus @default(PENDING)
+
+  startedAt   DateTime? @map("started_at") @db.Timestamp(3)
+  finishedAt  DateTime? @map("finished_at") @db.Timestamp(3)
+  // {promoted: N, retained: N, leavers: N, errors: [...]} — written by the
+  // bulk-promotion worker (Sprint 9). Schema-only this sprint.
+  summaryJson Json?     @map("summary_json")
+  triggeredBy String?   @map("triggered_by") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  sourceYear AcademicYear @relation("PromotionSourceYear", fields: [schoolId, sourceAcademicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_promotion_source_year")
+  targetYear AcademicYear @relation("PromotionTargetYear", fields: [schoolId, targetAcademicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_promotion_target_year")
+
+  @@id([schoolId, id])
+  @@index([schoolId, status], map: "ix_promotion_school_status")
+  @@index([schoolId, sourceAcademicYearId], map: "ix_promotion_school_source")
+  @@index([schoolId, targetAcademicYearId], map: "ix_promotion_school_target")
+  @@map("academic_year_promotions")
+}

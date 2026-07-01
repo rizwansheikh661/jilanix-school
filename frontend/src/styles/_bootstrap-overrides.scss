@@ -1,0 +1,147 @@
+// ============================================================================
+// Bootstrap variable overrides
+// Mapped to SchoolOS design tokens (ENTERPRISE_DESIGN_SYSTEM.md).
+// Loaded BEFORE bootstrap/scss/bootstrap so values cascade into compiled CSS.
+// ============================================================================
+
+// Brand
+$primary:    #2D4FCC;
+$secondary:  #0E9F8E;
+$success:    #15803D;
+$info:       #1E5FBE;
+$warning:    #B45309;
+$danger:     #B42318;
+$light:      #F7F8FB;
+$dark:       #1A2235;
+
+// Typography
+$font-family-sans-serif: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+$font-family-monospace:  'JetBrains Mono', 'SFMono-Regular', Menlo, Consolas, monospace;
+$font-size-base:   0.875rem;   // 14px
+$line-height-base: 1.5;
+$headings-font-weight: 600;
+$headings-color:   #1A2235;
+$body-color:       #1A2235;
+$body-bg:          #F7F8FB;
+$text-muted:       #828B9D;
+
+// Borders / radii
+$border-color:        #E4E7EE;
+$border-radius:       0.5rem;   // 8px
+$border-radius-sm:    0.25rem;  // 4px
+$border-radius-lg:    0.75rem;  // 12px
+$border-radius-xl:    1rem;     // 16px
+$border-radius-pill:  999px;
+
+// Buttons
+$btn-padding-y:           0.5rem;
+$btn-padding-x:           1rem;
+$btn-font-size:           1rem;
+$btn-font-weight:         500;
+$btn-border-radius:       0.5rem;
+$btn-padding-y-sm:        0.375rem;
+$btn-padding-x-sm:        0.75rem;
+$btn-font-size-sm:        0.875rem;
+$btn-border-radius-sm:    0.375rem;
+$btn-padding-y-lg:        0.75rem;
+$btn-padding-x-lg:        1.5rem;
+$btn-font-size-lg:        1.125rem;
+$btn-border-radius-lg:    0.5rem;
+$btn-focus-width:         0;        // we draw our own ring
+$btn-box-shadow:          none;
+$btn-active-box-shadow:   none;
+
+// Inputs
+$input-bg:                #FFFFFF;
+$input-color:             #1A2235;
+$input-border-color:      #D5DAE3;
+$input-border-radius:     0.5rem;
+$input-padding-y:         0.5rem;
+$input-padding-x:         0.75rem;
+$input-focus-border-color: #2D4FCC;
+$input-focus-box-shadow:  0 0 0 3px rgba(45, 79, 204, 0.30);
+$input-placeholder-color: #828B9D;
+
+// Cards
+$card-bg:                 #FFFFFF;
+$card-border-color:       #E4E7EE;
+$card-border-radius:      0.75rem;
+$card-cap-bg:             transparent;
+$card-cap-padding-y:      1rem;
+$card-cap-padding-x:      1.25rem;
+$card-spacer-y:           1.25rem;
+$card-spacer-x:           1.25rem;
+$card-box-shadow:         var(--shadow-sm);
+
+// Tables
+$table-bg:                transparent;
+$table-color:             #1A2235;
+$table-border-color:      #E4E7EE;
+$table-cell-padding-y:    0.875rem;
+$table-cell-padding-x:    1rem;
+$table-hover-bg:          #F4F6FB;
+$table-striped-bg:        transparent; // explicit: no stripes
+
+// Dropdowns
+$dropdown-bg:             #FFFFFF;
+$dropdown-border-color:   #E4E7EE;
+$dropdown-border-radius:  0.5rem;
+$dropdown-padding-y:      0.5rem;
+$dropdown-link-hover-bg:  #F4F6FB;
+$dropdown-link-active-bg: #EEF1FC;
+$dropdown-link-active-color: #2D4FCC;
+$dropdown-box-shadow:     var(--shadow-md);
+
+// Modals
+$modal-content-bg:           #FFFFFF;
+$modal-content-border-color: #E4E7EE;
+$modal-content-border-radius: 0.75rem;
+$modal-content-box-shadow-xs: var(--shadow-overlay);
+$modal-content-box-shadow-sm-up: var(--shadow-overlay);
+$modal-backdrop-bg:          #000;
+$modal-backdrop-opacity:     0.40;
+$modal-header-padding-y:     1.25rem;
+$modal-header-padding-x:     1.5rem;
+$modal-inner-padding:        1.5rem;
+$modal-footer-padding-y:     1rem;
+
+// Offcanvas (Drawer)
+$offcanvas-padding-y:        1.25rem;
+$offcanvas-padding-x:        1.5rem;
+$offcanvas-bg-color:         #FFFFFF;
+$offcanvas-color:            #1A2235;
+$offcanvas-border-color:     #E4E7EE;
+$offcanvas-box-shadow:       var(--shadow-overlay);
+
+// Badges
+$badge-padding-y:            0.25rem;
+$badge-padding-x:            0.5rem;
+$badge-font-size:            0.75rem;
+$badge-font-weight:          600;
+$badge-border-radius:        999px;
+
+// Pagination — visual only; we use cursor pagination semantically
+$pagination-color:           #2D4FCC;
+$pagination-bg:              #FFFFFF;
+$pagination-border-color:    #E4E7EE;
+$pagination-hover-bg:        #F4F6FB;
+$pagination-active-bg:       #2D4FCC;
+$pagination-active-border-color: #2D4FCC;
+$pagination-disabled-color:  #828B9D;
+
+// Breadcrumb
+$breadcrumb-font-size:       0.8125rem;
+$breadcrumb-padding-y:       0;
+$breadcrumb-padding-x:       0;
+$breadcrumb-item-padding-x:  0.5rem;
+$breadcrumb-divider-color:   #828B9D;
+$breadcrumb-active-color:    #1A2235;
+
+// Tabs / nav
+$nav-tabs-border-color:        #E4E7EE;
+$nav-tabs-link-active-color:   #2D4FCC;
+$nav-tabs-link-active-border-color: #E4E7EE #E4E7EE #FFFFFF;
+$nav-pills-link-active-bg:     #2D4FCC;
+
+// Spacers (extend the default scale slightly)
+$spacer: 1rem;

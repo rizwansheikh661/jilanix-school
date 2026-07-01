@@ -1,0 +1,806 @@
+You are an elite team consisting of:
+
+- SaaS Founder
+- Product Manager
+- Business Analyst
+- School Management Consultant
+- UI/UX Designer
+- Staff Frontend Engineer
+- Staff Backend Engineer
+- Database Architect
+- DevOps Architect
+- Security Architect
+
+Your goal is to design a complete School Operating System (School ERP SaaS Platform) for Indian Schools.
+
+==================================================
+BUSINESS GOAL
+==================================================
+
+The platform should be capable of serving:
+
+- Private Schools
+- CBSE Schools
+- ICSE Schools
+- State Board Schools
+- Schools with 100 to 5000 students
+
+Target Market:
+
+- India
+- Tier 2 Cities
+- Tier 3 Cities
+- Affordable Pricing
+- SaaS Subscription Model
+
+The platform should be designed as a product that can eventually serve 1000+ schools.
+
+==================================================
+TECH STACK
+==================================================
+
+Frontend:
+- Next.js Latest
+- React
+- TypeScript
+- TailwindCSS
+- Shadcn UI
+
+Backend:
+- Node.js
+- NestJS
+- TypeScript
+
+Database:
+- MySQL
+
+ORM:
+- Prisma
+
+Authentication:
+- JWT
+- Refresh Tokens
+
+Storage:
+- S3 Compatible Storage
+
+Deployment:
+- Docker
+
+Architecture:
+- Multi Tenant SaaS
+
+==================================================
+DESIGN REQUIREMENTS
+==================================================
+
+Do NOT create a generic admin panel.
+
+Create a premium modern SaaS experience.
+
+Design inspiration:
+
+- Stripe Dashboard
+- Linear
+- Vercel
+- Notion
+- Clerk
+- Supabase
+
+Requirements:
+
+- Modern UI
+- Premium Dashboard
+- Responsive
+- Mobile Friendly
+- Dark Mode
+- Light Mode
+- Accessibility
+- Fast Loading
+
+Create complete design system.
+
+==================================================
+MULTI TENANT REQUIREMENTS
+==================================================
+
+Every school must have isolated data.
+
+Use school_id based architecture.
+
+Every module must support multi tenancy.
+
+Explain:
+
+- Data isolation
+- Tenant security
+- Scaling strategy
+
+==================================================
+MODULES TO SUPPORT
+==================================================
+
+1. Authentication
+
+- Login
+- Logout
+- Forgot Password
+- Reset Password
+- Session Management
+
+--------------------------------------------------
+
+2. School Management
+
+- School Profile
+- Academic Year
+- Branches
+- School Settings
+- Logo
+- Certificate Templates
+
+--------------------------------------------------
+
+3. Student Management
+
+- Admissions
+- Student Profile
+- Documents
+- Medical Information
+- Blood Group
+- Promotion
+- Transfer Certificate
+- Student ID Card
+
+--------------------------------------------------
+
+4. Parent Management
+
+- Parent Accounts
+- Parent Login
+- Parent Portal
+- Parent Contact Information
+- Parent Communication
+
+--------------------------------------------------
+
+5. Teacher Management
+
+- Teacher Profiles
+- Qualifications
+- Experience
+- Documents
+- Attendance
+- Leave Management
+
+--------------------------------------------------
+
+6. Employee Management
+
+- Accountant
+- Clerk
+- Driver
+- Security
+- Support Staff
+
+--------------------------------------------------
+
+7. Academic Management
+
+- Classes
+- Sections
+- Subjects
+- Syllabus
+- Academic Calendar
+
+--------------------------------------------------
+
+8. Timetable Management
+
+- Teacher Allocation
+- Subject Allocation
+- Class Allocation
+- Auto Timetable Generation
+
+--------------------------------------------------
+
+9. Attendance Management
+
+Student Attendance
+
+Teacher Attendance
+
+Attendance Reports
+
+Monthly Reports
+
+Yearly Reports
+
+--------------------------------------------------
+
+10. Fees Management
+
+Admission Fees
+
+Annual Fees
+
+Monthly Fees
+
+Exam Fees
+
+Transport Fees
+
+Hostel Fees
+
+Event Fees
+
+Fine Management
+
+Discounts
+
+Scholarships
+
+Receipts
+
+Due Tracking
+
+--------------------------------------------------
+
+11. Examination Management
+
+Exam Creation
+
+Marks Entry
+
+Grade System
+
+Result Processing
+
+Report Cards
+
+Ranking
+
+Performance Analytics
+
+--------------------------------------------------
+
+12. Holiday Management
+
+National Holidays
+
+School Holidays
+
+Summer Vacation
+
+Winter Vacation
+
+Festival Holidays
+
+Holiday Calendar
+
+Holiday Notifications
+
+--------------------------------------------------
+
+13. Event Management
+
+Annual Function
+
+Republic Day
+
+Independence Day
+
+Sports Day
+
+Science Exhibition
+
+Cultural Programs
+
+School Tours
+
+Picnics
+
+Event Registrations
+
+Event Participation
+
+Event Budget
+
+Event Fees
+
+Certificates
+
+--------------------------------------------------
+
+14. Complaint Management
+
+Parent Complaints
+
+Teacher Complaints
+
+Student Complaints
+
+Transport Complaints
+
+Fee Complaints
+
+Incident Reporting
+
+Teacher Misconduct Reports
+
+Student Misconduct Reports
+
+Bullying Reports
+
+Action Tracking
+
+Resolution Tracking
+
+Evidence Upload
+
+Principal Remarks
+
+Closure Reports
+
+--------------------------------------------------
+
+15. Discipline Management
+
+Warnings
+
+Suspensions
+
+Behavior Records
+
+Disciplinary Actions
+
+--------------------------------------------------
+
+16. Transport Management
+
+Vehicles
+
+Routes
+
+Drivers
+
+Pickup Points
+
+Transport Fees
+
+GPS Ready Architecture
+
+--------------------------------------------------
+
+17. Hostel Management
+
+Rooms
+
+Students
+
+Visitors
+
+Hostel Fees
+
+Hostel Attendance
+
+--------------------------------------------------
+
+18. Library Management
+
+Books
+
+Issue Return
+
+Fine Management
+
+Book Inventory
+
+--------------------------------------------------
+
+19. Inventory Management
+
+Furniture
+
+Computers
+
+Projectors
+
+Lab Equipment
+
+Assets
+
+Stock Tracking
+
+--------------------------------------------------
+
+20. Visitor Management
+
+Visitor Entry
+
+Visitor Approval
+
+Visitor Logs
+
+--------------------------------------------------
+
+21. Medical Management
+
+Health Records
+
+Medical Incidents
+
+Medicine Records
+
+Vaccination Records
+
+--------------------------------------------------
+
+22. Communication System
+
+Notifications
+
+Email
+
+SMS
+
+WhatsApp Ready Architecture
+
+Broadcast Messaging
+
+Announcements
+
+--------------------------------------------------
+
+23. Notice Board
+
+Circulars
+
+Announcements
+
+Exam Notices
+
+Event Notices
+
+--------------------------------------------------
+
+24. Certificate Management
+
+Bonafide Certificate
+
+Transfer Certificate
+
+Character Certificate
+
+Participation Certificate
+
+Custom Certificates
+
+--------------------------------------------------
+
+25. Reports & Analytics
+
+Attendance Reports
+
+Fee Reports
+
+Student Reports
+
+Teacher Reports
+
+Performance Reports
+
+Custom Reports
+
+--------------------------------------------------
+
+26. AI Features (Future)
+
+AI Report Card Comments
+
+AI Parent Chatbot
+
+AI Attendance Analytics
+
+AI Timetable Generator
+
+AI Fee Defaulter Prediction
+
+AI Student Performance Analytics
+
+==================================================
+ROLE BASED ACCESS CONTROL
+==================================================
+
+Roles:
+
+- Super Admin
+- School Admin
+- Principal
+- Vice Principal
+- Teacher
+- Accountant
+- Clerk
+- Parent
+- Student
+- Driver
+- Librarian
+
+Define permissions for every role.
+
+==================================================
+DATABASE DESIGN
+==================================================
+
+Create:
+
+1. Complete ER Diagram
+2. Complete MySQL Schema
+3. Complete Prisma Schema
+4. Index Strategy
+5. Audit Log Strategy
+6. Soft Delete Strategy
+7. Multi Tenant Strategy
+
+Generate all tables and relationships.
+
+==================================================
+API DESIGN
+==================================================
+
+Generate complete REST API specifications.
+
+For every module include:
+
+- Endpoint
+- Method
+- Request
+- Response
+- Validation Rules
+- Error Handling
+
+==================================================
+BACKEND DESIGN
+==================================================
+
+Create:
+
+- Enterprise NestJS Architecture
+- Folder Structure
+- Modules
+- Services
+- Controllers
+- DTOs
+- Guards
+- Interceptors
+- Middleware
+- Logging
+- Exception Handling
+
+==================================================
+FRONTEND DESIGN
+==================================================
+
+Create:
+
+- Next.js Architecture
+- Folder Structure
+- Layouts
+- Pages
+- Components
+- State Management
+- API Integration
+
+Design every page in detail.
+
+==================================================
+OUTPUT FORMAT
+==================================================
+
+Step 1:
+Business Architecture
+
+Step 2:
+Module Breakdown
+
+Step 3:
+Database Architecture
+
+Step 4:
+ER Diagram
+
+Step 5:
+Prisma Schema
+
+Step 6:
+Backend Architecture
+
+Step 7:
+Frontend Architecture
+
+Step 8:
+Design System
+
+Step 9:
+API Specifications
+
+Step 10:
+Deployment Architecture
+
+Step 11:
+Scaling Strategy
+
+Step 12:
+Development Roadmap
+
+Provide extremely detailed output.
+Think like the CTO of a SaaS company building a product for 1000+ schools.
+
+Start only with Step 1: Business Architecture + Module Breakdown.
+
+Do NOT generate code yet.
+Only explain product structure, modules, and SaaS strategy.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-----------------------------------------------------
+Good.
+
+Now proceed to Step 3: Database Architecture.
+
+Design full MySQL schema with relationships and multi-tenant structure.
+
+Do NOT generate backend or frontend code yet.
+
+
+
+
+
+
+
+
+----------------------------------------------------
+
+
+Now proceed to Step 4: ER Diagram explanation and Prisma schema design.
+
+Keep it production ready.
+------------------------------------------------------
+
+
+
+Now proceed to Step 5: Backend Architecture (NestJS).
+
+Only design structure, modules, folder structure, and API list.
+
+No code yet.
+
+--------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Now generate ONLY Authentication module backend code using NestJS + Prisma + MySQL.
+
+Include:
+- Controller
+- Service
+- DTO
+- Module
+- Guard
+- JWT setup
+
+Follow production standards.
+
+
+-------------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+Now generate Student Module backend.
+
+Same structure, production ready code.
+
+
+
+
+
+
+
+
+------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+Now generate Fees Management module backend.
+
+
+---------------------------------------------
+
+
+
+
+Now design the complete UI system for Next.js + Tailwind + Shadcn UI.
+
+Create:
+- Dashboard UI
+- Sidebar
+- Layout system
+- Design system (colors, buttons, cards)
+
+
+-------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Now generate Next.js frontend for Authentication pages only
+
+
+
+
+
+
+
+-----------------------------------------------

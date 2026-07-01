@@ -1,0 +1,105 @@
+# Sprint 1 compose: API + MySQL 8. Sprint N1 adds Mailpit for local email.
+# Redis lands in a future sprint.
+#
+# Usage from backend/:
+#   docker compose -f docker/docker-compose.yml up --build           # all
+#   docker compose -f docker/docker-compose.yml up -d mysql mailpit  # infra only
+#   docker compose -f docker/docker-compose.yml up -d mailpit        # mail sink only
+#   docker compose -f docker/docker-compose.yml down                 # stop
+#   docker compose -f docker/docker-compose.yml down -v              # nuke volumes
+#
+# Mailpit web UI: http://localhost:8025
+# Mailpit SMTP:   localhost:1025  (Nodemailer / EmailTransportService points here)
+#
+# Env precedence (highest → lowest):
+#   1. shell env at compose-time (CI / per-run overrides)
+#   2. backend/.env
+#   3. defaults below
+
+name: schoolos
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: schoolos-mysql
+    restart: unless-stopped
+    command:
+      - --defaults-file=/etc/mysql/conf.d/my.cnf
+      - --default-time-zone=+00:00
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-schoolos}
+      MYSQL_USER: ${MYSQL_USER:-app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-app}
+      TZ: UTC
+    ports:
+      - '${MYSQL_HOST_PORT:-3306}:3306'
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - mysql-logs:/var/log/mysql
+      - ./mysql/my.cnf:/etc/mysql/conf.d/my.cnf:ro
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+      - ./mysql/healthcheck.sh:/usr/local/bin/healthcheck.sh:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'sh /usr/local/bin/healthcheck.sh']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    cap_add:
+      - SYS_NICE   # silences "mbind: Operation not permitted" on Linux hosts
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: schoolos-mailpit
+    restart: unless-stopped
+    ports:
+      - '${MAILPIT_SMTP_PORT:-1025}:1025'   # SMTP — point SMTP_HOST/SMTP_PORT here
+      - '${MAILPIT_UI_PORT:-8025}:8025'     # Web UI — http://localhost:8025
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: '1'
+      MP_SMTP_AUTH_ALLOW_INSECURE: '1'
+      MP_MAX_MESSAGES: '500'
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:8025/api/v1/info']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  api:
+    image: schoolos-api:dev
+    container_name: schoolos-api
+    build:
+      context: ..
+      dockerfile: docker/api.Dockerfile
+      args:
+        APP_BUILD_SHA: ${APP_BUILD_SHA:-local}
+        APP_BUILD_TIME: ${APP_BUILD_TIME:-local}
+    env_file:
+      - ../.env
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      APP_HOST: 0.0.0.0
+      APP_PORT: 3000
+      # Override DB_URL inside the compose network so the API talks to the
+      # mysql service by DNS name rather than localhost.
+      DB_URL: ${DB_URL_INTERNAL:-mysql://app:app@mysql:3306/schoolos?connection_limit=10&pool_timeout=10&connect_timeout=10}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - '${APP_PORT:-3000}:3000'
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:3000/health']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  mysql-data:
+    name: schoolos-mysql-data
+  mysql-logs:
+    name: schoolos-mysql-logs

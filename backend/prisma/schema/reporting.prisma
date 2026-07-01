@@ -1,0 +1,534 @@
+// ---------------------------------------------------------------------------
+// reporting.prisma — Sprint 13 Reporting, Import/Export & Bulk Operations
+// Foundation.
+//
+// 8 models, all TENANT_OWNED with composite (school_id, id) PKs:
+//   - ReportRun        — one row per requested report. status lifecycle
+//                        PENDING → RUNNING → SUCCEEDED|FAILED|CANCELLED.
+//                        Auto-coded RPT-<seq> via SEQ_NAMES.REPORT_RUN
+//                        (non-FY). Result file lives in FileAsset
+//                        (purpose=REPORT_EXPORT). Soft-delete + active-
+//                        uniqueness via STORED on (school_id, code).
+//   - ImportJob        — one row per multipart upload. status PENDING →
+//                        VALIDATING → VALIDATED → COMMITTING →
+//                        COMMITTED|FAILED|CANCELLED. Source file
+//                        (purpose=BULK_IMPORT) stays on FileAsset
+//                        post-completion for audit. Soft-delete + active-
+//                        uniqueness via STORED on (school_id, code).
+//   - ImportJobIssue   — per-row issues raised by the validator (ERROR /
+//                        WARNING / INFO). Paginated under the parent job.
+//                        TENANT_OWNED with composite FK to ImportJob.
+//   - BulkOperation    — one row per (kind, mode) invocation. Three modes:
+//                        PREVIEW (count summary), VALIDATE (per-row
+//                        issues), EXECUTE (job-queued mutation). Status
+//                        DRAFT → PREVIEWED → VALIDATED → EXECUTING →
+//                        COMPLETED|FAILED|CANCELLED.
+//   - Dashboard        — user-owned, tenant-scoped CRUD container.
+//                        Soft-delete cascades to widgets.
+//   - DashboardWidget  — typed widget config (METRIC/CHART_*/TABLE/...).
+//                        Composite FK to Dashboard. No data resolution
+//                        in v1; widgets are display configs only.
+//   - ReportSchedule   — saved {reportKind, cron, recipients} row.
+//                        Stores nextRunAt for a future cron runner;
+//                        the runner itself lands in a later sprint.
+//   - ReportTemplate   — saved filter sets per report kind. isShared
+//                        flag enables tenant-wide visibility while
+//                        ownedByUserId restricts mutation.
+//
+// Doc gap (DATABASE_DESIGN.md / MODEL_INVENTORY.md have NO entries for this
+// domain) — Sprint 13 proposes the table set from scratch. Naming follows
+// Sprint 10/11/12 precedent: snake_case @@map identifiers, ix_<table>_<columns>
+// index naming, composite (school_id, *_id) FKs for tenant-owned parents,
+// single-column FKs only for FileAsset (TENANT_SHARED_PLATFORM).
+//
+// REST_API_DESIGN.md does not include /reports, /imports, /bulk-operations.
+// Sprint 13 mounts at /api/v1/reports, /api/v1/imports, /api/v1/bulk-operations,
+// /api/v1/dashboards, /api/v1/report-schedules, /api/v1/report-templates.
+// Resource-rooted, mirrors Sprint 11/12.
+//
+// Hand-edits required in migration.sql (Prisma can't emit STORED columns):
+//   - report_runs.deleted_at_key       + uq_report_run_code_active
+//                                        (school_id, code, deleted_at_key)
+//   - import_jobs.deleted_at_key       + uq_import_job_code_active
+//                                        (school_id, code, deleted_at_key)
+//   - bulk_operations.deleted_at_key   + uq_bulk_op_code_active
+//                                        (school_id, code, deleted_at_key)
+//   - dashboards.deleted_at_key        + uq_dashboard_code_active
+//                                        (school_id, code, deleted_at_key)
+//   - report_schedules.deleted_at_key  + uq_report_schedule_code_active
+//                                        (school_id, code, deleted_at_key)
+//   - report_templates.deleted_at_key  + uq_report_template_code_active
+//                                        (school_id, code, deleted_at_key)
+//
+// Cross-sprint reuse:
+//   - Sprint 5 file-storage:    ReportRun.fileAssetId + ImportJob.
+//                               sourceFileAssetId FK → FileAsset. Uses
+//                               existing FilePurpose enum values
+//                               REPORT_EXPORT (50 MiB) + BULK_IMPORT
+//                               (50 MiB). No new purposes registered.
+//   - Sprint 5 sequences:       6 non-FY sequences added (REPORT_RUN,
+//                               IMPORT_JOB, BULK_OPERATION, DASHBOARD,
+//                               REPORT_SCHEDULE, REPORT_TEMPLATE).
+//   - Sprint 5 jobs:            ReportRun / ImportJob / BulkOperation
+//                               carry queuedJobId. 4 new handler names
+//                               (report.run, import.run, import.commit,
+//                               bulk-op.execute) registered with
+//                               JobHandlerRegistry.
+//   - Sprint 10 notifications:  5 event-key catalog entries registered at
+//                               boot (REPORT_READY/FAILED, IMPORT_
+//                               COMPLETED/FAILED, BULK_OPERATION_
+//                               COMPLETED). Dispatched from job handlers
+//                               post-success / post-failure.
+//   - Sprint 11/12 services:    Bulk-op STUDENT_PROMOTE delegates to
+//                               existing AcademicYearPromotionService.
+//                               Report engine reuses StudentsService.
+//                               search, FeesService.outstandingByStudent,
+//                               AssignmentSubmissionRepository, etc.
+// ---------------------------------------------------------------------------
+
+enum ReportKind {
+  STUDENT_LIST
+  STUDENT_ATTENDANCE_SUMMARY
+  STAFF_ATTENDANCE_SUMMARY
+  EXAM_MARKS_SHEET
+  EXAM_RESULT_SUMMARY
+  FEE_COLLECTION_SUMMARY
+  FEE_OUTSTANDING
+  HOMEWORK_COMPLIANCE
+  SYLLABUS_PROGRESS
+}
+
+enum ReportFormat {
+  CSV
+  EXCEL
+  PDF
+}
+
+enum ReportRunStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+enum ImportKind {
+  STUDENT
+  STAFF
+  EXAM_MARKS
+  ATTENDANCE
+  FEE_PAYMENT
+}
+
+enum ImportJobStatus {
+  PENDING
+  VALIDATING
+  VALIDATED
+  COMMITTING
+  COMMITTED
+  FAILED
+  CANCELLED
+}
+
+enum ImportIssueSeverity {
+  ERROR
+  WARNING
+  INFO
+}
+
+enum BulkOperationKind {
+  STUDENT_PROMOTE
+  STUDENT_TRANSFER_SECTION
+  STUDENT_DEACTIVATE
+  STAFF_DEACTIVATE
+  FEE_WAIVE
+  HOMEWORK_CLOSE
+  ASSIGNMENT_CLOSE
+}
+
+enum BulkOperationMode {
+  PREVIEW
+  VALIDATE
+  EXECUTE
+}
+
+enum BulkOperationStatus {
+  DRAFT
+  PREVIEWED
+  VALIDATED
+  EXECUTING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum DashboardWidgetKind {
+  METRIC
+  CHART_LINE
+  CHART_BAR
+  CHART_PIE
+  TABLE
+  LIST
+  TEXT
+}
+
+enum ReportScheduleFrequency {
+  DAILY
+  WEEKLY
+  MONTHLY
+  CUSTOM_CRON
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_report_run_code_active partial
+/// unique are added in migration.sql (Prisma can't emit GENERATED ALWAYS AS).
+model ReportRun {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Auto-coded RPT-<seq> via TenantSequences (SEQ_NAMES.REPORT_RUN, non-FY).
+  code   String          @db.VarChar(40)
+  kind   ReportKind
+  format ReportFormat
+  status ReportRunStatus @default(PENDING)
+
+  requestedByUserId String   @map("requested_by_user_id") @db.Char(36)
+  requestedAt       DateTime @default(now()) @map("requested_at") @db.Timestamp(3)
+
+  // Snapshot of the filter inputs the requester chose. Service-validated
+  // against the kind's filter DTO before insert.
+  params Json
+
+  // ULID of the queued Job row that materializes this report. Single-column
+  // FK; Job is CROSS_TENANT_OPERATIONAL with single-column PK.
+  queuedJobId String? @map("queued_job_id") @db.Char(36)
+
+  startedAt    DateTime? @map("started_at") @db.Timestamp(3)
+  endedAt      DateTime? @map("ended_at") @db.Timestamp(3)
+  errorMessage String?   @map("error_message") @db.VarChar(2000)
+
+  // Result asset. Set on SUCCEEDED only. Single-column FK to FileAsset
+  // (TENANT_SHARED_PLATFORM with single-column PK).
+  fileAssetId String? @map("file_asset_id") @db.Char(36)
+
+  // # of rows materialized into the export. Denormalized; written once at
+  // success.
+  rowCount Int @default(0) @map("row_count")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  @@id([schoolId, id])
+  @@index([schoolId, status, requestedAt], map: "ix_report_run_school_status_requested")
+  @@index([schoolId, kind, requestedAt], map: "ix_report_run_school_kind_requested")
+  @@index([schoolId, requestedByUserId], map: "ix_report_run_school_requested_by")
+  @@index([schoolId, deletedAt], map: "ix_report_run_deleted_at")
+  @@map("report_runs")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_import_job_code_active partial
+/// unique are added in migration.sql.
+model ImportJob {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Auto-coded IMP-<seq> via TenantSequences (SEQ_NAMES.IMPORT_JOB, non-FY).
+  code   String          @db.VarChar(40)
+  kind   ImportKind
+  status ImportJobStatus @default(PENDING)
+
+  requestedByUserId String   @map("requested_by_user_id") @db.Char(36)
+  requestedAt       DateTime @default(now()) @map("requested_at") @db.Timestamp(3)
+
+  // Source spreadsheet. Single-column FK to FileAsset by Sprint 11/12
+  // precedent. Retained on import-job soft-delete (operator's source-of-
+  // truth for diagnosing failed imports).
+  sourceFileAssetId String @map("source_file_asset_id") @db.Char(36)
+
+  // Free-form caller-supplied options (commitOnSuccess, skipHeaderRows, ...).
+  options Json
+
+  queuedJobId String? @map("queued_job_id") @db.Char(36)
+
+  // Denormalized counters — maintained inside the import handler with
+  // optimistic version guards.
+  totalRows     Int @default(0) @map("total_rows")
+  validRows     Int @default(0) @map("valid_rows")
+  errorRows     Int @default(0) @map("error_rows")
+  committedRows Int @default(0) @map("committed_rows")
+
+  startedAt    DateTime? @map("started_at") @db.Timestamp(3)
+  endedAt      DateTime? @map("ended_at") @db.Timestamp(3)
+  errorMessage String?   @map("error_message") @db.VarChar(2000)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  issues ImportJobIssue[] @relation("ImportJobIssues")
+
+  @@id([schoolId, id])
+  @@index([schoolId, status, requestedAt], map: "ix_import_job_school_status_requested")
+  @@index([schoolId, kind, requestedAt], map: "ix_import_job_school_kind_requested")
+  @@index([schoolId, requestedByUserId], map: "ix_import_job_school_requested_by")
+  @@index([schoolId, deletedAt], map: "ix_import_job_deleted_at")
+  @@map("import_jobs")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// Issues raised by the per-kind row validator. Severity controls whether
+/// the row blocks commit (ERROR) or is informational (WARNING/INFO).
+model ImportJobIssue {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  importJobId String @map("import_job_id") @db.Char(36)
+
+  // 1-based source row number in the uploaded spreadsheet.
+  rowNumber     Int                 @map("row_number")
+  columnName    String?             @map("column_name") @db.VarChar(100)
+  severity      ImportIssueSeverity
+  code          String              @db.VarChar(80)
+  message       String              @db.VarChar(1000)
+  // User-supplied cell value at columnName, when available — null for
+  // row-level issues (no columnName) or commit-time WARNINGS (no cell
+  // snapshot). Capped at 500 chars to match the repository's slice().
+  providedValue String?             @map("provided_value") @db.VarChar(500)
+  // Snapshot of the offending row for diagnostics.
+  rowSnapshot   Json?               @map("row_snapshot")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  importJob ImportJob @relation("ImportJobIssues", fields: [schoolId, importJobId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_import_job_issue_job")
+
+  @@id([schoolId, id])
+  @@index([schoolId, importJobId, severity], map: "ix_import_job_issue_school_job_severity")
+  @@index([schoolId, importJobId, rowNumber], map: "ix_import_job_issue_school_job_row")
+  @@index([schoolId, deletedAt], map: "ix_import_job_issue_deleted_at")
+  @@map("import_job_issues")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_bulk_op_code_active partial
+/// unique are added in migration.sql.
+model BulkOperation {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Auto-coded BOP-<seq> via TenantSequences (SEQ_NAMES.BULK_OPERATION,
+  // non-FY).
+  code   String              @db.VarChar(40)
+  kind   BulkOperationKind
+  mode   BulkOperationMode
+  status BulkOperationStatus @default(DRAFT)
+
+  requestedByUserId String   @map("requested_by_user_id") @db.Char(36)
+  requestedAt       DateTime @default(now()) @map("requested_at") @db.Timestamp(3)
+
+  // Caller-supplied params (targetIds + per-kind discriminated payload).
+  // Service validates per kind catalog.
+  params Json
+
+  queuedJobId String? @map("queued_job_id") @db.Char(36)
+
+  // Denormalized counters — maintained inside the executor handler.
+  targetCount    Int @default(0) @map("target_count")
+  processedCount Int @default(0) @map("processed_count")
+  succeededCount Int @default(0) @map("succeeded_count")
+  failedCount    Int @default(0) @map("failed_count")
+
+  // PREVIEW/VALIDATE payloads — large enough to live in JSON columns since
+  // they're bounded by the 500-target preview/validate cap.
+  previewResult    Json? @map("preview_result")
+  validationResult Json? @map("validation_result")
+
+  startedAt    DateTime? @map("started_at") @db.Timestamp(3)
+  endedAt      DateTime? @map("ended_at") @db.Timestamp(3)
+  errorMessage String?   @map("error_message") @db.VarChar(2000)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  @@id([schoolId, id])
+  @@index([schoolId, status, requestedAt], map: "ix_bulk_op_school_status_requested")
+  @@index([schoolId, kind, requestedAt], map: "ix_bulk_op_school_kind_requested")
+  @@index([schoolId, requestedByUserId], map: "ix_bulk_op_school_requested_by")
+  @@index([schoolId, deletedAt], map: "ix_bulk_op_deleted_at")
+  @@map("bulk_operations")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_dashboard_code_active partial
+/// unique are added in migration.sql.
+model Dashboard {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Auto-coded DSH-<seq> via TenantSequences (SEQ_NAMES.DASHBOARD, non-FY).
+  code        String  @db.VarChar(40)
+  name        String  @db.VarChar(200)
+  description String? @db.VarChar(1000)
+  isDefault   Boolean @default(false) @map("is_default")
+
+  ownedByUserId String @map("owned_by_user_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  widgets DashboardWidget[] @relation("DashboardWidgets")
+
+  @@id([schoolId, id])
+  @@index([schoolId, ownedByUserId], map: "ix_dashboard_school_owned_by")
+  @@index([schoolId, deletedAt], map: "ix_dashboard_deleted_at")
+  @@map("dashboards")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// Display-config only in v1 (no data resolver). `config` JSON is opaque
+/// to the platform; the widget kind discriminates how the future read-side
+/// resolver should interpret it.
+model DashboardWidget {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  dashboardId String @map("dashboard_id") @db.Char(36)
+
+  kind     DashboardWidgetKind
+  position Int
+  title    String              @db.VarChar(200)
+  config   Json
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  dashboard Dashboard @relation("DashboardWidgets", fields: [schoolId, dashboardId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_dashboard_widget_dashboard")
+
+  @@id([schoolId, id])
+  @@index([schoolId, dashboardId, position], map: "ix_dashboard_widget_school_dashboard_position")
+  @@index([schoolId, deletedAt], map: "ix_dashboard_widget_deleted_at")
+  @@map("dashboard_widgets")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_report_schedule_code_active
+/// partial unique are added in migration.sql.
+/// Cron runner not implemented in Sprint 13 — nextRunAt is stored and
+/// isEnabled is toggled, but nothing fires the schedules. A future
+/// scheduler sprint reads `isEnabled = true AND nextRunAt <= now()`.
+model ReportSchedule {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Auto-coded SCHED-<seq> via TenantSequences (SEQ_NAMES.REPORT_SCHEDULE,
+  // non-FY).
+  code       String       @db.VarChar(40)
+  name       String       @db.VarChar(200)
+  reportKind ReportKind   @map("report_kind")
+  format     ReportFormat
+
+  frequency ReportScheduleFrequency
+  // Canonical cron string (5-field). Derived for DAILY/WEEKLY/MONTHLY,
+  // user-supplied for CUSTOM_CRON. Validated via cron-parser in service.
+  cron      String                  @db.VarChar(120)
+
+  params     Json
+  recipients Json
+
+  isEnabled       Boolean   @default(true) @map("is_enabled")
+  nextRunAt       DateTime? @map("next_run_at") @db.Timestamp(3)
+  lastRunAt       DateTime? @map("last_run_at") @db.Timestamp(3)
+  lastReportRunId String?   @map("last_report_run_id") @db.Char(36)
+
+  ownedByUserId String @map("owned_by_user_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  @@id([schoolId, id])
+  @@index([schoolId, isEnabled, nextRunAt], map: "ix_report_schedule_school_enabled_next")
+  @@index([schoolId, reportKind], map: "ix_report_schedule_school_kind")
+  @@index([schoolId, ownedByUserId], map: "ix_report_schedule_school_owned_by")
+  @@index([schoolId, deletedAt], map: "ix_report_schedule_deleted_at")
+  @@map("report_schedules")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_report_template_code_active
+/// partial unique are added in migration.sql.
+/// Owner-write, shared-read: ownedByUserId restricts UPDATE/DELETE; any
+/// user in the tenant can READ a template marked isShared=true.
+model ReportTemplate {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Auto-coded TPL-<seq> via TenantSequences (SEQ_NAMES.REPORT_TEMPLATE,
+  // non-FY).
+  code        String     @db.VarChar(40)
+  name        String     @db.VarChar(200)
+  description String?    @db.VarChar(1000)
+  reportKind  ReportKind @map("report_kind")
+
+  params   Json
+  isShared Boolean @default(false) @map("is_shared")
+
+  ownedByUserId String @map("owned_by_user_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  @@id([schoolId, id])
+  @@index([schoolId, reportKind], map: "ix_report_template_school_kind")
+  @@index([schoolId, ownedByUserId], map: "ix_report_template_school_owned_by")
+  @@index([schoolId, isShared], map: "ix_report_template_school_shared")
+  @@index([schoolId, deletedAt], map: "ix_report_template_deleted_at")
+  @@map("report_templates")
+}

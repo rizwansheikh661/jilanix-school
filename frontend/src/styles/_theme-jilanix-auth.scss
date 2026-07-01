@@ -1,0 +1,676 @@
+// ============================================================================
+// Jilanix Operator Console — Auth chrome (LOCKED to approved mockup)
+//
+// Layout contract:
+//   - .jlx-auth-shell fits inside 100vh with no page scroll.
+//   - Card is pushed toward the top of the right panel (mockup shows
+//     noticeably more empty space below the card than above it).
+//   - Every value resolves to a token from _tokens.scss.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// SHELL — two-column layout, viewport-locked
+// ----------------------------------------------------------------------------
+
+.jlx-auth-shell {
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  background-color: var(--bg-app);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+}
+
+// ----------------------------------------------------------------------------
+// LEFT BRANDING PANEL
+// ----------------------------------------------------------------------------
+
+.jlx-auth-shell__brand {
+  width: var(--auth-branding-width);
+  height: 100%;
+  position: relative;
+  isolation: isolate;
+  color: var(--jlx-on-brand);
+  padding: 32px clamp(28px, 3vw, 40px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+
+  background-color: var(--jlx-bg-primary);
+
+  // Blurred building artwork — pseudo layer so the blur does not
+  // bleed onto the heading / lede / features. Slight negative inset
+  // hides the softened edges that `blur()` produces at the frame.
+  &::before {
+    content: '';
+    position: absolute;
+    inset: -12px;
+    z-index: 0;
+    background-image: url('/assets/branding/auth-school-building.png');
+    background-size: cover;
+    background-position: center 30%;
+    background-repeat: no-repeat;
+    filter: blur(2.5px);
+    transform: translateZ(0);
+  }
+
+  // Top-heavy plum wash sits above the blurred artwork so the copy
+  // stays legible while the roof, wall-mounted logo, and Indian flag
+  // remain visible.
+  &::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    background-image: linear-gradient(
+      180deg,
+      rgba(26, 21, 51, 0.62) 0%,
+      rgba(45, 30, 90, 0.32) 34%,
+      rgba(26, 21, 51, 0.16) 68%,
+      rgba(26, 21, 51, 0.06) 100%
+    );
+    pointer-events: none;
+  }
+}
+
+.jlx-auth-shell__brand-inner {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 24px;
+  max-width: 480px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+// Hero mark — centered top: logo → wordmark → gold-flanked tag.
+.jlx-brand-hero-mark {
+  align-self: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+
+  img {
+    display: block;
+    width: 170px;
+    height: 130px;
+  }
+}
+
+.jlx-brand-hero-mark__title {
+  font-size: 40px;
+  font-weight: var(--weight-bold);
+  letter-spacing: 8px;
+  color: var(--jlx-on-brand);
+  text-transform: uppercase;
+  line-height: 1;
+}
+
+.jlx-brand-hero-mark__tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 10.5px;
+  font-weight: var(--weight-semibold);
+  letter-spacing: 3.2px;
+  color: var(--jlx-highlight);
+  text-transform: uppercase;
+
+  &::before,
+  &::after {
+    content: '';
+    display: inline-block;
+    width: 26px;
+    height: 1px;
+    background: var(--jlx-highlight);
+    opacity: 0.85;
+  }
+}
+
+// Headline + lede
+.jlx-brand-hero {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: flex-start;
+  align-self: stretch;
+}
+
+.jlx-brand-hero__title {
+  font-size: clamp(28px, 2.8vw, 34px);
+  font-weight: var(--weight-bold);
+  line-height: 1.15;
+  letter-spacing: -0.4px;
+  color: var(--jlx-on-brand);
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+
+  em {
+    color: var(--jlx-highlight);
+    font-style: normal;
+  }
+}
+
+.jlx-brand-hero__title-line {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.35em;
+}
+
+// Word-by-word entrance — fade + gentle rise. Reveal cascades left to
+// right, top to bottom via per-word `animation-delay` set inline.
+@keyframes jlx-word-in {
+  from { opacity: 0; transform: translateY(14px); filter: blur(4px); }
+  to   { opacity: 1; transform: translateY(0);    filter: blur(0);   }
+}
+
+.jlx-brand-hero__title-word {
+  display: inline-block;
+  opacity: 0;
+  will-change: transform, opacity;
+  animation: jlx-word-in 620ms var(--motion-ease-out) forwards;
+}
+
+.jlx-brand-hero__lede {
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--jlx-on-brand-muted);
+  margin: 0;
+  max-width: 42ch;
+  opacity: 0;
+  animation: jlx-word-in 520ms var(--motion-ease-out) 520ms forwards;
+}
+
+// 4-column feature strip
+.jlx-brand-features {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  padding: 0;
+  list-style: none;
+  align-self: stretch;
+}
+
+// ----------------------------------------------------------------------------
+// Feature entrance — gentle fade + rise after the title cascade lands.
+// Baseline delay (720 ms) lines up with the last title word.
+// ----------------------------------------------------------------------------
+@keyframes jlx-feature-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.jlx-brand-feature {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 8px;
+  opacity: 0;
+  animation: jlx-feature-in 480ms var(--motion-ease-out) forwards;
+
+  &:nth-child(1) { animation-delay: 780ms; }
+  &:nth-child(2) { animation-delay: 860ms; }
+  &:nth-child(3) { animation-delay: 940ms; }
+  &:nth-child(4) { animation-delay: 1020ms; }
+}
+
+.jlx-brand-feature__icon {
+  width: 50px;
+  height: 50px;
+  border-radius: var(--radius-pill);
+  background-color: rgba(107, 70, 193, 0.55);
+  border: 1px solid rgba(247, 185, 77, 0.35);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--jlx-highlight);
+  transition:
+    transform 280ms var(--motion-ease-out),
+    border-color 280ms var(--motion-ease-out),
+    background-color 280ms var(--motion-ease-out),
+    box-shadow 280ms var(--motion-ease-out);
+}
+
+// Enterprise hover: soft lift + warmer gold ring + layered glow.
+// No spin, no scale-flash — a quiet, premium "interactive" cue.
+.jlx-brand-feature:hover .jlx-brand-feature__icon,
+.jlx-brand-feature:focus-within .jlx-brand-feature__icon {
+  transform: translateY(-3px);
+  background-color: rgba(107, 70, 193, 0.78);
+  border-color: var(--jlx-highlight);
+  box-shadow:
+    0 0 0 4px rgba(247, 185, 77, 0.18),
+    0 12px 24px -8px rgba(15, 11, 31, 0.60);
+}
+
+.jlx-brand-feature__title {
+  font-size: 12px;
+  font-weight: var(--weight-semibold);
+  color: var(--jlx-on-brand);
+  line-height: 1.25;
+}
+
+.jlx-brand-feature__sub {
+  font-size: 10.5px;
+  font-weight: var(--weight-regular);
+  color: var(--jlx-on-brand);
+  line-height: 1.35;
+  letter-spacing: -0.1px;
+}
+
+// Respect users who prefer no motion — no entrance, no hover glow.
+@media (prefers-reduced-motion: reduce) {
+  .jlx-brand-hero__title-word,
+  .jlx-brand-hero__lede,
+  .jlx-brand-feature {
+    opacity: 1;
+    transform: none;
+    filter: none;
+    animation: none;
+  }
+  .jlx-brand-feature__icon {
+    transition: none;
+  }
+  .jlx-brand-feature:hover .jlx-brand-feature__icon,
+  .jlx-brand-feature:focus-within .jlx-brand-feature__icon {
+    transform: none;
+    box-shadow: none;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// RIGHT COLUMN
+// ----------------------------------------------------------------------------
+
+.jlx-auth-shell__panel {
+  flex: 1 1 auto;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 32px clamp(24px, 4vw, 60px) 16px;
+  background-color: var(--bg-app);
+}
+
+// Push card upward — mockup has more empty space below than above.
+.jlx-auth-shell__panel-body {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: var(--auth-card-max);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  padding-top: 8px;
+}
+
+.jlx-auth-shell__panel-footer {
+  align-self: stretch;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-muted);
+  padding-top: 12px;
+}
+
+// ----------------------------------------------------------------------------
+// AUTH CARD
+// ----------------------------------------------------------------------------
+
+.jlx-auth-card {
+  background-color: var(--surface-card);
+  border-radius: var(--radius-2xl);
+  padding: 32px clamp(28px, 3vw, 36px);
+  box-shadow: var(--shadow-auth-card);
+  border: 1px solid var(--border-default);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.jlx-auth-card__brand {
+  display: flex;
+  justify-content: center;
+
+  img {
+    width: 100px;
+    height: 100px;
+    display: block;
+  }
+}
+
+.jlx-auth-card__header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  text-align: center;
+}
+
+.jlx-auth-card__title {
+  font-size: 30px;
+  font-weight: var(--weight-bold);
+  color: var(--text-primary);
+  line-height: 1.15;
+  letter-spacing: -0.4px;
+  margin: 0;
+}
+
+.jlx-auth-card__subtitle {
+  font-size: 14px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+  margin: 0;
+}
+
+.jlx-auth-card__form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.jlx-auth-card__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.jlx-auth-card__footer {
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+// ----------------------------------------------------------------------------
+// LINK ACCENTS
+// ----------------------------------------------------------------------------
+
+.jlx-link-accent {
+  color: var(--jlx-highlight);
+  font-weight: var(--weight-semibold);
+  text-decoration: none;
+  transition: opacity var(--motion-duration-fast) var(--motion-ease-out);
+
+  &:hover,
+  &:focus-visible { opacity: 0.85; text-decoration: underline; }
+}
+
+.jlx-link-primary {
+  color: var(--brand-primary);
+  font-weight: var(--weight-semibold);
+  text-decoration: none;
+  transition: color var(--motion-duration-fast) var(--motion-ease-out);
+
+  &:hover { color: var(--brand-primary-hover); text-decoration: underline; }
+}
+
+// ----------------------------------------------------------------------------
+// FIELD PRIMITIVES
+// ----------------------------------------------------------------------------
+
+.jlx-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.jlx-field__label {
+  font-size: 13px;
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+}
+
+.jlx-field__control {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.jlx-field__input {
+  width: 100%;
+  height: 42px;
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-md);
+  background-color: var(--surface-card);
+  color: var(--text-primary);
+  font-size: 14px;
+  font-family: var(--font-sans);
+  padding: 0 14px 0 40px;
+  transition:
+    border-color var(--motion-duration-fast) var(--motion-ease-out),
+    box-shadow var(--motion-duration-fast) var(--motion-ease-out);
+
+  &::placeholder { color: var(--text-muted); }
+  &:hover:not(:disabled) { border-color: var(--border-strong); }
+
+  &:focus,
+  &:focus-visible {
+    outline: none;
+    border-color: var(--brand-primary);
+    box-shadow: var(--focus-ring);
+  }
+
+  &[aria-invalid='true'] {
+    border-color: var(--color-danger);
+    &:focus,
+    &:focus-visible { box-shadow: var(--focus-ring-danger); }
+  }
+
+  &:disabled {
+    background-color: var(--surface-muted);
+    color: var(--text-muted);
+    cursor: not-allowed;
+  }
+}
+
+.jlx-field__input--no-icon       { padding-left: 14px; }
+.jlx-field__input--with-trailing { padding-right: 40px; }
+
+.jlx-field__icon {
+  position: absolute;
+  left: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  display: inline-flex;
+  pointer-events: none;
+}
+
+.jlx-field__trailing {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    background-color var(--motion-duration-fast) var(--motion-ease-out),
+    color var(--motion-duration-fast) var(--motion-ease-out);
+
+  &:hover { background-color: var(--surface-muted); color: var(--text-primary); }
+  &:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+}
+
+.jlx-field__error {
+  font-size: 12px;
+  color: var(--color-danger);
+  line-height: 1.35;
+  margin: 0;
+}
+
+.jlx-field__hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.35;
+  margin: 0;
+}
+
+.jlx-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 13px;
+  color: var(--text-secondary);
+
+  input[type='checkbox'] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--brand-primary);
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// PRIMARY BUTTON — reusable ERP-wide CTA (LOCKED)
+//
+// Deep-plum gradient built from the brand tokens (bg-secondary → bg-primary),
+// height matches the input rhythm, soft tinted shadow, arrow travels on hover.
+// ----------------------------------------------------------------------------
+
+.jlx-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 44px;
+  padding: 0 20px;
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  font-weight: var(--weight-semibold);
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background var(--motion-duration-fast) var(--motion-ease-out),
+    box-shadow var(--motion-duration-fast) var(--motion-ease-out),
+    transform var(--motion-duration-fast) var(--motion-ease-out);
+
+  &:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+  &:disabled { cursor: not-allowed; opacity: 0.65; }
+}
+
+.jlx-btn--primary {
+  background: linear-gradient(180deg, var(--jlx-bg-secondary) 0%, var(--jlx-bg-primary) 100%);
+  color: var(--jlx-on-brand);
+  box-shadow: 0 10px 20px -12px rgba(26, 21, 51, 0.55);
+
+  &:hover:not(:disabled) {
+    background: linear-gradient(180deg, #372459 0%, #221A44 100%);
+    box-shadow: 0 14px 24px -12px rgba(26, 21, 51, 0.65);
+    transform: translateY(-1px);
+  }
+
+  &:active:not(:disabled) {
+    transform: translateY(0);
+    box-shadow: 0 6px 12px -8px rgba(26, 21, 51, 0.55);
+  }
+}
+
+.jlx-btn--ghost {
+  background-color: transparent;
+  color: var(--text-secondary);
+  border-color: var(--border-default);
+
+  &:hover:not(:disabled) { background-color: var(--surface-muted); color: var(--text-primary); }
+}
+
+.jlx-btn--block { width: 100%; }
+
+.jlx-btn__arrow { transition: transform var(--motion-duration-fast) var(--motion-ease-out); }
+
+.jlx-btn--primary:hover:not(:disabled) .jlx-btn__arrow { transform: translateX(4px); }
+
+// ----------------------------------------------------------------------------
+// SKELETON (Suspense fallback)
+// ----------------------------------------------------------------------------
+
+@keyframes jlx-skeleton-pulse {
+  0%   { opacity: 1; }
+  50%  { opacity: 0.55; }
+  100% { opacity: 1; }
+}
+
+.jlx-skeleton {
+  display: block;
+  background-color: var(--surface-muted);
+  border-radius: var(--radius-sm);
+  animation: jlx-skeleton-pulse 1.4s ease-in-out infinite;
+}
+
+.jlx-skeleton--brand { height: 100px; width: 100px; border-radius: var(--radius-lg); margin: 0 auto 12px; }
+.jlx-skeleton--title { height: 30px;  width: 60%;   margin: 0 auto 8px; }
+.jlx-skeleton--sub   { height: 14px;  width: 70%;   margin: 0 auto 20px; }
+.jlx-skeleton--field { height: 42px;  width: 100%;  margin-bottom: 14px; border-radius: var(--radius-md); }
+.jlx-skeleton--cta   { height: 44px;  width: 100%;  margin-top: 4px;     border-radius: var(--radius-md); }
+
+// ----------------------------------------------------------------------------
+// RESPONSIVE — stacked layout releases the 100vh lock (mobile needs scroll)
+// ----------------------------------------------------------------------------
+
+@media (max-width: 991.98px) {
+  .jlx-auth-shell {
+    flex-direction: column;
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+
+  .jlx-auth-shell__brand {
+    width: 100%;
+    height: auto;
+    min-height: 420px;
+    padding: 28px 24px 32px;
+  }
+  .jlx-auth-shell__brand::before { background-position: center 40%; }
+  .jlx-auth-shell__brand-inner { gap: 20px; }
+  .jlx-brand-hero-mark img     { width: 170px !important; height: 104px; }
+  .jlx-brand-hero-mark__title  { font-size: 32px; letter-spacing: 6px; }
+  .jlx-brand-hero__title       { font-size: 26px; }
+
+  .jlx-auth-shell__panel { height: auto; padding: 20px; }
+}
+
+@media (max-width: 575.98px) {
+  .jlx-brand-features       { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .jlx-auth-card            { padding: 24px 20px; }
+  .jlx-auth-card__brand img { width: 84px; height: 84px; }
+  .jlx-auth-card__title     { font-size: 24px; }
+}
+
+// ----------------------------------------------------------------------------
+// DARK THEME — branding panel stays deep-plum in both themes.
+// ----------------------------------------------------------------------------
+
+[data-theme='dark'] .jlx-auth-shell__brand {
+  background-color: var(--jlx-bg-primary);
+}
+
+[data-theme='dark'] .jlx-auth-shell__brand::after {
+  background-image: linear-gradient(
+    180deg,
+    rgba(15, 11, 31, 0.68) 0%,
+    rgba(37, 28, 72, 0.38) 34%,
+    rgba(15, 11, 31, 0.16) 68%,
+    rgba(15, 11, 31, 0.08) 100%
+  );
+}

@@ -1,0 +1,113 @@
+name: backend-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'backend/**'
+      - '.github/workflows/ci.yml'
+
+defaults:
+  run:
+    working-directory: backend
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: schoolos
+          MYSQL_USER: app
+          MYSQL_PASSWORD: app
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uapp -papp --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+          --health-start-period=30s
+
+    env:
+      DB_URL: mysql://app:app@127.0.0.1:3306/schoolos?connection_limit=10&pool_timeout=10&connect_timeout=10
+      NODE_ENV: development
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: backend/.nvmrc
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+        env:
+          HUSKY: 0
+
+      - name: Prisma generate
+        run: npm run prisma:generate
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Format check
+        run: npm run format:check
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Validate .env.example covers schema
+        run: npm run check:env-example
+
+      - name: Validate env (default schema)
+        run: npm run validate:env
+
+      - name: Apply migrations (idempotent — empty in Sprint 1)
+        run: npm run prisma:migrate:deploy
+
+      - name: Seed (dev target)
+        run: npm run prisma:seed
+        env:
+          SEED_TARGET: dev
+
+      - name: Unit tests
+        run: npm run test:unit -- --coverage
+
+      - name: E2E tests (smoke)
+        run: npm run test:e2e
+
+      - name: Build
+        run: npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          file: backend/docker/api.Dockerfile
+          push: false
+          tags: schoolos-api:ci
+          build-args: |
+            APP_BUILD_SHA=${{ github.sha }}
+            APP_BUILD_TIME=${{ github.event.head_commit.timestamp }}

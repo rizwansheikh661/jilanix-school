@@ -1,0 +1,188 @@
+// ---------------------------------------------------------------------------
+// calendar.prisma — Calendar foundation (Sprint 4.5).
+//
+// Three tables that downstream sprints (Attendance S8, Timetable S12,
+// Notices S13, Report cards S15) all consume:
+//
+//   - `WorkingDaysConfiguration` — per-day-of-week working / non-working
+//                                  pattern. School-wide rows or branch
+//                                  overrides. Multiple effective windows
+//                                  via `effectiveFrom` / `effectiveTo`.
+//                                  Resolution rule (held in
+//                                  WorkingDayResolutionService): holiday
+//                                  first, then per-branch row > school-wide
+//                                  row > `school_settings.working_days_json`
+//                                  fallback.
+//   - `CalendarEvent`            — events the school publishes (PTM, EVENT,
+//                                  EXAM_WINDOW, TERM_START, TERM_END).
+//                                  Holidays are NOT here — they live in the
+//                                  `holidays` table because attendance has
+//                                  to mark them differently.
+//   - `Holiday`                  — discrete dates (or half-days) where the
+//                                  school is closed. Attendance % calc reads
+//                                  this to skip the denominator.
+//
+// All TENANT_OWNED. Calendar events soft-delete; holidays soft-delete;
+// working-days rows do NOT soft-delete (history-style — supersede via
+// effective windows instead).
+// ---------------------------------------------------------------------------
+
+enum SessionType {
+  FULL
+  HALF
+  ALTERNATE_SAT
+  FIRST_THIRD_SAT
+  SECOND_FOURTH_SAT
+}
+
+enum CalendarEventType {
+  EVENT
+  PTM
+  EXAM_WINDOW
+  TERM_START
+  TERM_END
+  OTHER
+}
+
+enum HolidayType {
+  NATIONAL
+  STATE
+  SCHOOL
+  RELIGIOUS
+  OPTIONAL
+}
+
+enum HalfDaySession {
+  FIRST_HALF
+  SECOND_HALF
+}
+
+enum AttendanceTreatment {
+  HOLIDAY
+  WORKING_DAY
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model WorkingDaysConfiguration {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Null = school-wide default. Non-null = branch override.
+  branchId String? @map("branch_id") @db.Char(36)
+
+  // 1=Mon..7=Sun (ISO-8601). DTO validates the range.
+  dayOfWeek   Int         @map("day_of_week")
+  isWorking   Boolean     @map("is_working")
+  // FULL by default; HALF / ALTERNATE_SAT etc. for partial Saturdays etc.
+  sessionType SessionType @default(FULL) @map("session_type")
+
+  effectiveFrom DateTime  @map("effective_from") @db.Date
+  // Service stamps `effectiveTo` on the prior open row when a new row for
+  // the same (school, branch?, dayOfWeek) is inserted with a later
+  // `effectiveFrom`. Null = currently in effect.
+  effectiveTo   DateTime? @map("effective_to") @db.Date
+  note          String?   @db.VarChar(255)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  branch Branch? @relation("BranchWorkingDays", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_wdc_branch")
+
+  @@id([schoolId, id])
+  // Note: a STORED computed `branch_key` column + unique index is added in
+  // a hand-edit to the migration (Prisma's MySQL provider can't emit
+  // GENERATED columns). Sentinel `__none__` makes school-wide rows distinct
+  // from branch-scoped ones. Mirror of TenantSequence.fiscal_year_key.
+  @@index([schoolId, branchId, dayOfWeek], map: "ix_wdc_school_branch_dow")
+  @@map("working_days_configuration")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model CalendarEvent {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Null = school-wide event.
+  branchId       String? @map("branch_id") @db.Char(36)
+  // Null = not academic-year-bound (e.g. founders' day).
+  academicYearId String? @map("academic_year_id") @db.Char(36)
+
+  type        CalendarEventType
+  title       String            @db.VarChar(200)
+  description String?           @db.Text
+
+  startDate DateTime  @map("start_date") @db.Date
+  endDate   DateTime  @map("end_date") @db.Date
+  allDay    Boolean   @default(true) @map("all_day")
+  // Required when allDay=false. DTO enforces start < end.
+  startTime DateTime? @map("start_time") @db.Time(0)
+  endTime   DateTime? @map("end_time") @db.Time(0)
+
+  // ["STUDENT","PARENT","STAFF"] — null/empty = everyone. Drives
+  // /calendar/upcoming filtering.
+  audienceJson   Json?   @map("audience_json")
+  colorHex       String? @map("color_hex") @db.Char(7)
+  isRecurring    Boolean @default(false) @map("is_recurring")
+  // RFC-5545 RRULE string. Parsed at read-time by the upcoming-events
+  // expander.
+  recurrenceRule String? @map("recurrence_rule") @db.VarChar(200)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  branch       Branch?       @relation("BranchCalendarEvents", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_calendar_event_branch")
+  academicYear AcademicYear? @relation("AcademicYearCalendarEvents", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_calendar_event_year")
+
+  @@id([schoolId, id])
+  @@index([schoolId, branchId, startDate], map: "ix_calendar_event_school_branch_start")
+  @@index([schoolId, type, startDate], map: "ix_calendar_event_school_type_start")
+  @@index([schoolId, academicYearId], map: "ix_calendar_event_school_year")
+  @@map("calendar_events")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model Holiday {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Null = school-wide holiday.
+  branchId String? @map("branch_id") @db.Char(36)
+
+  name                String              @db.VarChar(120)
+  date                DateTime            @db.Date
+  type                HolidayType
+  isFullDay           Boolean             @default(true) @map("is_full_day")
+  // Required when isFullDay=false (DTO validates).
+  halfDaySession      HalfDaySession?     @map("half_day_session")
+  // Some "optional" holidays are still working days for attendance
+  // purposes — service applies this when computing the attendance %
+  // denominator.
+  attendanceTreatment AttendanceTreatment @default(HOLIDAY) @map("attendance_treatment")
+  notes               String?             @db.VarChar(255)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  branch Branch? @relation("BranchHolidays", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_holiday_branch")
+
+  @@id([schoolId, id])
+  @@index([schoolId, branchId, date], map: "ix_holiday_school_branch_date")
+  @@index([schoolId, date, type], map: "ix_holiday_school_date_type")
+  @@map("holidays")
+}

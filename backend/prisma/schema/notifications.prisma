@@ -1,0 +1,463 @@
+// ---------------------------------------------------------------------------
+// notifications.prisma — Sprint 10 Notifications & Communication Foundation.
+//
+// 8 models, all TENANT_OWNED with composite (school_id, id) PKs:
+//   - NotificationTemplate             — channel/category-scoped template
+//                                        header; isActive + activeVersionNo
+//                                        drive render lookup. Soft-delete +
+//                                        active-uniqueness via STORED on
+//                                        (school_id, channel, code).
+//   - NotificationTemplateVersion      — APPEND_ONLY versioned body
+//                                        (subject/bodyText/bodyHtml +
+//                                        variables snapshot). One row per
+//                                        edit; queued messages bind to the
+//                                        version-no they rendered against.
+//   - NotificationMessage              — outbound envelope per recipient ×
+//                                        channel. gap-allowed NTF-<seq> ref
+//                                        (SEQ_NAMES.NOTIFICATION). Status
+//                                        machine QUEUED → SENT → DELIVERED
+//                                        (or FAILED / DEAD_LETTER / CANCELLED
+//                                        / READ). Soft-delete + active-
+//                                        uniqueness via STORED on
+//                                        (school_id, dedupe_key).
+//   - NotificationMessageEvent         — APPEND_ONLY per-message delivery
+//                                        ledger (QUEUED/SENT/DELIVERED/
+//                                        FAILED/READ/CANCELLED/DEAD_LETTER/
+//                                        RETRY_SCHEDULED).
+//   - NotificationUserPreference       — one row per user; channel matrix +
+//                                        per-category opt-outs + quiet hours.
+//                                        Soft-delete + active-uniqueness via
+//                                        STORED on (school_id, user_id).
+//   - NotificationCampaign             — broadcast envelope: targetType
+//                                        (SCHOOL/BRANCH/CLASS/SECTION) +
+//                                        template + channels. Auto-coded
+//                                        CMP-<seq> via SEQ_NAMES.NOTIFICATION.
+//                                        Soft-delete + active-uniqueness via
+//                                        STORED on (school_id, code).
+//   - NotificationCampaignRecipient    — APPEND_ONLY resolution log; rows
+//                                        with skipped=true record why
+//                                        (OPTED_OUT / QUIET_HOURS /
+//                                        QUOTA_EXHAUSTED / CHANNEL_DISABLED).
+//   - SchoolCommunicationEntitlement   — singleton per school (no soft-delete
+//                                        — service auto-upserts). Per-channel
+//                                        enable flags + monthly limits +
+//                                        rolling usage counters.
+//
+// MODEL_INVENTORY §12 deviation (Sprint 10 adopts 8 of the 14 listed tables):
+//   - notification_opt_outs + notification_quiet_hours → folded into
+//     NotificationUserPreference (single matrix row per user).
+//   - notification_credit_pool + notification_credit_ledger +
+//     notification_credit_topups → deferred to Subscription/Billing sprint.
+//     SchoolCommunicationEntitlement is the v1 quota engine.
+//   - dlt_registrations + push_devices → deferred (no real provider
+//     integration yet; flag-gated stubs for SES/SendGrid/MSG91/Twilio/WABA).
+//
+// Hand-edits required in migration.sql (Prisma can't emit STORED columns):
+//   - notification_templates.deleted_at_key        + uq_notification_template_active
+//                                                    (school_id, channel, code, deleted_at_key)
+//   - notification_messages.deleted_at_key         + uq_notification_message_dedupe_active
+//                                                    (school_id, dedupe_key, deleted_at_key)
+//                                                    (null-permissive — only rows with
+//                                                    a dedupe_key participate)
+//   - notification_user_preferences.deleted_at_key + uq_notification_preference_user_active
+//                                                    (school_id, user_id, deleted_at_key)
+//   - notification_campaigns.deleted_at_key        + uq_notification_campaign_code_active
+//                                                    (school_id, code, deleted_at_key)
+//
+// Reuse of Sprint 5 infra: dispatcher reads notification.queued outbox topic
+// → enqueues a Job via JobEnqueueService; DLQ via existing JobDeadLetter.
+// ---------------------------------------------------------------------------
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+  WHATSAPP
+  IN_APP
+  PUSH
+}
+
+enum NotificationCategory {
+  ACADEMIC
+  ATTENDANCE
+  EXAMINATION
+  FEES
+  ADMISSIONS
+  STAFF
+  TIMETABLE
+  FINANCE
+  COMMUNICATION
+  SYSTEM
+}
+
+enum NotificationPriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum NotificationMessageStatus {
+  QUEUED
+  SENDING
+  SENT
+  DELIVERED
+  FAILED
+  DEAD_LETTER
+  CANCELLED
+  READ
+}
+
+enum NotificationCampaignStatus {
+  DRAFT
+  QUEUED
+  SENDING
+  COMPLETED
+  CANCELLED
+  FAILED
+}
+
+enum NotificationCampaignTarget {
+  SCHOOL
+  BRANCH
+  CLASS
+  SECTION
+}
+
+enum NotificationAudienceType {
+  USER
+  PARENT
+  STUDENT
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_notification_template_active partial
+/// unique are added in migration.sql (Prisma can't emit GENERATED ALWAYS AS).
+model NotificationTemplate {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  code            String                   @db.VarChar(60)
+  name            String                   @db.VarChar(160)
+  description     String?                  @db.VarChar(500)
+  channel         NotificationChannel
+  category        NotificationCategory
+  eventKey        String?                  @map("event_key") @db.VarChar(80)
+  defaultPriority NotificationPriority     @default(MEDIUM) @map("default_priority")
+  locale          String                   @default("en-IN") @db.Char(5)
+  isActive        Boolean                  @default(true) @map("is_active")
+  activeVersionNo Int                      @default(1) @map("active_version_no")
+  audience        NotificationAudienceType @default(USER)
+  variablesSpec   Json?                    @map("variables_spec")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  versions  NotificationTemplateVersion[] @relation("NotificationTemplateVersions")
+  messages  NotificationMessage[]         @relation("NotificationMessageTemplate")
+  campaigns NotificationCampaign[]        @relation("NotificationCampaignTemplate")
+
+  @@id([schoolId, id])
+  @@index([schoolId, channel, category], map: "ix_notification_template_school_channel_category")
+  @@index([schoolId, eventKey], map: "ix_notification_template_school_event")
+  @@index([schoolId, isActive], map: "ix_notification_template_school_active")
+  @@index([schoolId, deletedAt], map: "ix_notification_template_deleted_at")
+  @@map("notification_templates")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model NotificationTemplateVersion {
+  // APPEND_ONLY. New versions are inserted; old versions are kept for
+  // historical render binding (NotificationMessage.templateVersionNo).
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  notificationTemplateId String @map("notification_template_id") @db.Char(36)
+
+  versionNo         Int     @map("version_no")
+  subject           String? @db.VarChar(255)
+  bodyText          String  @map("body_text") @db.Text
+  bodyHtml          String? @map("body_html") @db.Text
+  variablesSnapshot Json?   @map("variables_snapshot")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+
+  template NotificationTemplate @relation("NotificationTemplateVersions", fields: [schoolId, notificationTemplateId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_notification_template_version_template")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, notificationTemplateId, versionNo], map: "uq_notification_template_version")
+  @@index([schoolId, notificationTemplateId, versionNo], map: "ix_notification_template_version_school_template_no")
+  @@map("notification_template_versions")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_notification_message_dedupe_active
+/// partial unique are added in migration.sql (null-permissive on dedupe_key).
+/// Not partitioned in Sprint 10 — MODEL_INVENTORY's monthly RANGE partitioning
+/// is deferred until volumes warrant the operational cost.
+model NotificationMessage {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Gap-allowed NTF-<seq> via TenantSequences (SEQ_NAMES.NOTIFICATION, non-FY).
+  messageNo String? @map("message_no") @db.VarChar(40)
+
+  recipientUserId   String                   @map("recipient_user_id") @db.Char(36)
+  recipientAudience NotificationAudienceType @default(USER) @map("recipient_audience")
+  // Email / phone / userId-for-inapp — channel-specific physical address.
+  recipientAddress  String                   @map("recipient_address") @db.VarChar(255)
+
+  channel  NotificationChannel
+  category NotificationCategory
+  priority NotificationPriority @default(MEDIUM)
+
+  notificationTemplateId String? @map("notification_template_id") @db.Char(36)
+  templateVersionNo      Int?    @map("template_version_no")
+  eventKey               String? @map("event_key") @db.VarChar(80)
+  aggregateType          String? @map("aggregate_type") @db.VarChar(60)
+  aggregateId            String? @map("aggregate_id") @db.Char(36)
+
+  subjectRendered  String? @map("subject_rendered") @db.VarChar(255)
+  bodyRendered     String  @map("body_rendered") @db.Text
+  bodyHtmlRendered String? @map("body_html_rendered") @db.Text
+  dataPayload     Json?   @map("data_payload")
+  deepLink        String? @map("deep_link") @db.VarChar(500)
+  // Default `{eventKey}:{aggregateId}:{recipientUserId}:{channel}` —
+  // nullable for ad-hoc sends. Partial-unique enforced via STORED column.
+  dedupeKey       String? @map("dedupe_key") @db.VarChar(120)
+
+  status       NotificationMessageStatus @default(QUEUED)
+  scheduledAt  DateTime?                 @map("scheduled_at") @db.Timestamp(3)
+  sentAt       DateTime?                 @map("sent_at") @db.Timestamp(3)
+  deliveredAt  DateTime?                 @map("delivered_at") @db.Timestamp(3)
+  readAt       DateTime?                 @map("read_at") @db.Timestamp(3)
+  failedAt     DateTime?                 @map("failed_at") @db.Timestamp(3)
+  lastError    String?                   @map("last_error") @db.VarChar(500)
+  attemptCount Int                       @default(0) @map("attempt_count")
+  maxAttempts  Int                       @default(5) @map("max_attempts")
+
+  campaignId String? @map("campaign_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  template NotificationTemplate? @relation("NotificationMessageTemplate", fields: [schoolId, notificationTemplateId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_notification_message_template")
+  campaign NotificationCampaign? @relation("NotificationCampaignMessages", fields: [schoolId, campaignId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_notification_message_campaign")
+
+  events NotificationMessageEvent[] @relation("NotificationMessageEvents")
+
+  @@id([schoolId, id])
+  @@index([schoolId, recipientUserId, channel, status], map: "ix_notification_message_school_recipient_channel_status")
+  @@index([schoolId, status, scheduledAt], map: "ix_notification_message_school_status_scheduled")
+  @@index([schoolId, channel, status, createdAt], map: "ix_notification_message_school_channel_status_created")
+  @@index([schoolId, recipientUserId, readAt], map: "ix_notification_message_school_recipient_read")
+  @@index([schoolId, dedupeKey], map: "ix_notification_message_school_dedupe")
+  @@index([schoolId, campaignId], map: "ix_notification_message_school_campaign")
+  @@index([schoolId, deletedAt], map: "ix_notification_message_deleted_at")
+  @@map("notification_messages")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model NotificationMessageEvent {
+  // APPEND_ONLY. One row per state transition or provider callback.
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  notificationMessageId String @map("notification_message_id") @db.Char(36)
+
+  // QUEUED|SENDING|SENT|DELIVERED|FAILED|READ|CANCELLED|DEAD_LETTER|RETRY_SCHEDULED.
+  eventType         String   @map("event_type") @db.VarChar(40)
+  occurredAt        DateTime @default(now()) @map("occurred_at") @db.Timestamp(3)
+  providerCode      String?  @map("provider_code") @db.VarChar(40)
+  providerMessageId String?  @map("provider_message_id") @db.VarChar(120)
+  errorCode         String?  @map("error_code") @db.VarChar(80)
+  errorMessage      String?  @map("error_message") @db.VarChar(500)
+  metadata          Json?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+
+  message NotificationMessage @relation("NotificationMessageEvents", fields: [schoolId, notificationMessageId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_notification_message_event_message")
+
+  @@id([schoolId, id])
+  @@index([schoolId, notificationMessageId, occurredAt], map: "ix_notification_message_event_school_message_occurred")
+  @@map("notification_message_events")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_notification_preference_user_active
+/// partial unique are added in migration.sql (one active row per user).
+model NotificationUserPreference {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  userId String @map("user_id") @db.Char(36)
+
+  channelEmail      Boolean @default(true) @map("channel_email")
+  channelSms        Boolean @default(true) @map("channel_sms")
+  channelWhatsapp   Boolean @default(true) @map("channel_whatsapp")
+  channelInApp      Boolean @default(true) @map("channel_in_app")
+  // Sprint 17 — PUSH channel toggle. Mirrors the other channelX columns.
+  channelPush       Boolean @default(true) @map("channel_push")
+  // Sprint 17 — when true, CRITICAL-priority notifications bypass per-channel
+  // and per-category opt-outs. Default true (parents wanted on for safety alerts).
+  emergencyOverride Boolean @default(true) @map("emergency_override")
+
+  // Shape: { "ACADEMIC": ["EMAIL","SMS"], "FEES": ["WHATSAPP"] } → user
+  // opted out of those channels for the named category.
+  categoryOptOuts Json? @map("category_opt_outs")
+
+  // HH:MM strings; service treats them as local-to-timezone.
+  quietHoursStart    String? @default("21:00") @map("quiet_hours_start") @db.VarChar(5)
+  quietHoursEnd      String? @default("07:00") @map("quiet_hours_end") @db.VarChar(5)
+  quietHoursTimezone String? @default("Asia/Kolkata") @map("quiet_hours_timezone") @db.VarChar(40)
+
+  locale String @default("en-IN") @db.Char(5)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  @@id([schoolId, id])
+  @@index([schoolId, userId], map: "ix_notification_preference_school_user")
+  @@index([schoolId, deletedAt], map: "ix_notification_preference_deleted_at")
+  @@map("notification_user_preferences")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// NOTE: deleted_at_key STORED column + uq_notification_campaign_code_active
+/// partial unique are added in migration.sql.
+model NotificationCampaign {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Auto-coded CMP-<seq> via TenantSequences (SEQ_NAMES.NOTIFICATION, non-FY).
+  code        String? @db.VarChar(40)
+  name        String  @db.VarChar(160)
+  description String? @db.VarChar(500)
+
+  // Subset of NotificationChannel[] — stored as JSON array of enum strings.
+  channels Json
+
+  notificationTemplateId String                     @map("notification_template_id") @db.Char(36)
+  targetType             NotificationCampaignTarget @map("target_type")
+  targetId               String?                    @map("target_id") @db.Char(36)
+  audience               NotificationAudienceType   @default(USER)
+
+  scheduledAt DateTime?                  @map("scheduled_at") @db.Timestamp(3)
+  startedAt   DateTime?                  @map("started_at") @db.Timestamp(3)
+  completedAt DateTime?                  @map("completed_at") @db.Timestamp(3)
+  cancelledAt DateTime?                  @map("cancelled_at") @db.Timestamp(3)
+  status      NotificationCampaignStatus @default(DRAFT)
+
+  recipientCount Int @default(0) @map("recipient_count")
+  sentCount      Int @default(0) @map("sent_count")
+  failedCount    Int @default(0) @map("failed_count")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  template NotificationTemplate @relation("NotificationCampaignTemplate", fields: [schoolId, notificationTemplateId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_notification_campaign_template")
+
+  recipients NotificationCampaignRecipient[] @relation("NotificationCampaignRecipients")
+  messages   NotificationMessage[]           @relation("NotificationCampaignMessages")
+
+  @@id([schoolId, id])
+  @@index([schoolId, status, scheduledAt], map: "ix_notification_campaign_school_status_scheduled")
+  @@index([schoolId, notificationTemplateId], map: "ix_notification_campaign_school_template")
+  @@index([schoolId, targetType, targetId], map: "ix_notification_campaign_school_target")
+  @@index([schoolId, deletedAt], map: "ix_notification_campaign_deleted_at")
+  @@map("notification_campaigns")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model NotificationCampaignRecipient {
+  // APPEND_ONLY. Resolution log; skipped=true rows record skipReason
+  // (OPTED_OUT, QUIET_HOURS, QUOTA_EXHAUSTED, CHANNEL_DISABLED).
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  notificationCampaignId String                   @map("notification_campaign_id") @db.Char(36)
+  recipientUserId        String                   @map("recipient_user_id") @db.Char(36)
+  recipientAudience      NotificationAudienceType @default(USER) @map("recipient_audience")
+
+  resolvedAt       DateTime @default(now()) @map("resolved_at") @db.Timestamp(3)
+  resolutionReason String?  @map("resolution_reason") @db.VarChar(120)
+  skipped          Boolean  @default(false)
+  skipReason       String?  @map("skip_reason") @db.VarChar(120)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+
+  campaign NotificationCampaign @relation("NotificationCampaignRecipients", fields: [schoolId, notificationCampaignId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_notification_campaign_recipient_campaign")
+
+  @@id([schoolId, id])
+  @@index([schoolId, notificationCampaignId], map: "ix_notification_campaign_recipient_school_campaign")
+  @@index([schoolId, recipientUserId], map: "ix_notification_campaign_recipient_school_user")
+  @@map("notification_campaign_recipients")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+/// Singleton row per school — service auto-upserts on first access. NOT
+/// soft-deleted (deleting would orphan running counters); NOT APPEND_ONLY
+/// (counters mutate on every send). Uniqueness enforced by `schoolId` alone.
+model SchoolCommunicationEntitlement {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  emailEnabled    Boolean @default(true) @map("email_enabled")
+  smsEnabled      Boolean @default(false) @map("sms_enabled")
+  whatsappEnabled Boolean @default(false) @map("whatsapp_enabled")
+  inAppEnabled    Boolean @default(true) @map("in_app_enabled")
+
+  // null = unlimited; non-null is the monthly cap enforced before send.
+  emailMonthlyLimit    Int? @map("email_monthly_limit")
+  smsMonthlyLimit      Int? @map("sms_monthly_limit")
+  whatsappMonthlyLimit Int? @map("whatsapp_monthly_limit")
+
+  emailUsedThisPeriod    Int @default(0) @map("email_used_this_period")
+  smsUsedThisPeriod      Int @default(0) @map("sms_used_this_period")
+  whatsappUsedThisPeriod Int @default(0) @map("whatsapp_used_this_period")
+
+  usagePeriodStart DateTime  @map("usage_period_start") @db.Date
+  usagePeriodEnd   DateTime  @map("usage_period_end") @db.Date
+  isTrial          Boolean   @default(false) @map("is_trial")
+  trialExpiresAt   DateTime? @map("trial_expires_at") @db.Timestamp(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  @@id([schoolId, id])
+  @@unique([schoolId], map: "uq_school_communication_entitlement_school")
+  @@map("school_communication_entitlements")
+}

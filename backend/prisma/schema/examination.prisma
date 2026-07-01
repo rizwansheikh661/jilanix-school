@@ -1,0 +1,402 @@
+// ---------------------------------------------------------------------------
+// examination.prisma — Sprint 8 Examination Foundation (MVP).
+//
+// 10 models, all TENANT_OWNED with composite (school_id, id) PKs:
+//   - ExamScheme           — grading scheme (name + boardType + passingPct +
+//                            marksEditWindowDays). Soft-delete.
+//   - ExamSchemeBand       — child grade band on a scheme. Replaced wholesale
+//                            on scheme update (no soft-delete).
+//   - Exam                 — DRAFT/PUBLISHED/ARCHIVED state machine, scoped to
+//                            an academic year (+ optional term) and an
+//                            ExamScheme. Soft-delete.
+//   - ExamClassMap         — child rows mapping an Exam to one or more
+//                            Classes; cascade with parent Exam.
+//   - ExamSectionMap       — child rows mapping an Exam to one or more
+//                            Sections; cascade with parent Exam.
+//   - ExamSchedule         — per-(exam, subject, section) slot with date +
+//                            time-window + optional roomId + invigilator.
+//                            Soft-delete + active-uniqueness via STORED.
+//   - ExamMarks            — per-(exam, student, subject) row with absent
+//                            handling + optimistic-lock counter. Soft-delete
+//                            + active-uniqueness via STORED.
+//   - ExamMarksEditHistory — APPEND_ONLY ledger of every marks mutation.
+//   - ExamResult           — derived per-(exam, student) row built by
+//                            POST /results/compute. Soft-delete +
+//                            active-uniqueness via STORED.
+//   - ExamSubjectResult    — child of ExamResult; per-subject breakdown.
+//
+// Hand-edits required in migration.sql (Prisma can't emit STORED columns):
+//   - exam_schemes.deleted_at_key                 + uq_exam_scheme_active
+//   - exams.deleted_at_key                        + uq_exam_active
+//   - exam_schedules.deleted_at_key               + uq_exam_schedule_slot
+//   - exam_marks.deleted_at_key                   + uq_exam_marks_active
+//   - exam_results.deleted_at_key                 + uq_exam_result_active
+//   - exam_subject_results.deleted_at_key         + uq_exam_subject_result
+// ---------------------------------------------------------------------------
+
+enum ExamType {
+  UNIT_TEST
+  MONTHLY_TEST
+  QUARTERLY
+  HALF_YEARLY
+  ANNUAL
+  PRE_BOARD
+  OTHER
+}
+
+enum ExamStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum ExamResultStatus {
+  PENDING
+  COMPUTED
+  PUBLISHED
+}
+
+enum ExamMarksChangeType {
+  ENTERED
+  EDITED
+  DELETED
+  RESTORED
+  RECOMPUTED
+  CORRECTED
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model ExamScheme {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  name                String  @db.VarChar(120)
+  boardType           String? @map("board_type") @db.VarChar(60)
+  passingPct          Decimal @default(33.00) @map("passing_pct") @db.Decimal(5, 2)
+  marksEditWindowDays Int     @default(14) @map("marks_edit_window_days")
+  description         String? @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  bands ExamSchemeBand[] @relation("ExamSchemeBands")
+  exams Exam[]           @relation("ExamSchemeExams")
+
+  @@id([schoolId, id])
+  @@index([schoolId, name], map: "ix_exam_scheme_school_name")
+  @@index([schoolId, deletedAt], map: "ix_exam_scheme_deleted_at")
+  @@map("exam_schemes")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model ExamSchemeBand {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  examSchemeId String @map("exam_scheme_id") @db.Char(36)
+
+  gradeLetter String   @map("grade_letter") @db.VarChar(8)
+  gradePoint  Decimal? @map("grade_point") @db.Decimal(4, 2)
+  minPct      Decimal  @map("min_pct") @db.Decimal(5, 2)
+  maxPct      Decimal  @map("max_pct") @db.Decimal(5, 2)
+  ordering    Int
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  scheme ExamScheme @relation("ExamSchemeBands", fields: [schoolId, examSchemeId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_exam_scheme_band_scheme")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, examSchemeId, ordering], map: "uq_exam_scheme_band_ordering")
+  @@index([schoolId, examSchemeId], map: "ix_exam_scheme_band_school_scheme")
+  @@map("exam_scheme_bands")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model Exam {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  branchId       String? @map("branch_id") @db.Char(36)
+  academicYearId String  @map("academic_year_id") @db.Char(36)
+  academicTermId String? @map("academic_term_id") @db.Char(36)
+  examSchemeId   String  @map("exam_scheme_id") @db.Char(36)
+
+  name             String     @db.VarChar(160)
+  type             ExamType
+  status           ExamStatus @default(DRAFT)
+  startDate        DateTime   @map("start_date") @db.Date
+  endDate          DateTime   @map("end_date") @db.Date
+  defaultMaxMarks  Decimal    @default(100.00) @map("default_max_marks") @db.Decimal(6, 2)
+  defaultPassMarks Decimal    @default(33.00) @map("default_pass_marks") @db.Decimal(6, 2)
+  description      String?    @db.VarChar(500)
+  publishedAt      DateTime?  @map("published_at") @db.Timestamp(3)
+  archivedAt       DateTime?  @map("archived_at") @db.Timestamp(3)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  branch       Branch?       @relation("BranchExams", fields: [schoolId, branchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_branch")
+  academicYear AcademicYear  @relation("AcademicYearExams", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_year")
+  academicTerm AcademicTerm? @relation("AcademicTermExams", fields: [schoolId, academicTermId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_term")
+  scheme       ExamScheme    @relation("ExamSchemeExams", fields: [schoolId, examSchemeId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_scheme")
+
+  classMaps   ExamClassMap[]   @relation("ExamClassMaps")
+  sectionMaps ExamSectionMap[] @relation("ExamSectionMaps")
+  schedules   ExamSchedule[]   @relation("ExamSchedules")
+  marks       ExamMarks[]      @relation("ExamMarksByExam")
+  results     ExamResult[]     @relation("ExamResultsByExam")
+
+  @@id([schoolId, id])
+  @@index([schoolId, academicYearId, type], map: "ix_exam_school_year_type")
+  @@index([schoolId, status], map: "ix_exam_school_status")
+  @@index([schoolId, startDate], map: "ix_exam_school_start_date")
+  @@index([schoolId, deletedAt], map: "ix_exam_deleted_at")
+  @@map("exams")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model ExamClassMap {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  examId  String @map("exam_id") @db.Char(36)
+  classId String @map("class_id") @db.Char(36)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  exam  Exam  @relation("ExamClassMaps", fields: [schoolId, examId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_exam_class_map_exam")
+  class Class @relation("ClassExamMaps", fields: [schoolId, classId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_class_map_class")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, examId, classId], map: "uq_exam_class_map_exam_class")
+  @@index([schoolId, classId], map: "ix_exam_class_map_school_class")
+  @@map("exam_class_maps")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model ExamSectionMap {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  examId    String @map("exam_id") @db.Char(36)
+  sectionId String @map("section_id") @db.Char(36)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  exam    Exam    @relation("ExamSectionMaps", fields: [schoolId, examId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_exam_section_map_exam")
+  section Section @relation("SectionExamMaps", fields: [schoolId, sectionId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_section_map_section")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, examId, sectionId], map: "uq_exam_section_map_exam_section")
+  @@index([schoolId, sectionId], map: "ix_exam_section_map_school_section")
+  @@map("exam_section_maps")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model ExamSchedule {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  examId             String  @map("exam_id") @db.Char(36)
+  subjectId          String  @map("subject_id") @db.Char(36)
+  sectionId          String  @map("section_id") @db.Char(36)
+  roomId             String? @map("room_id") @db.Char(36)
+  invigilatorStaffId String? @map("invigilator_staff_id") @db.Char(36)
+
+  date         DateTime @db.Date
+  startTime    DateTime @map("start_time") @db.Time(0)
+  endTime      DateTime @map("end_time") @db.Time(0)
+  maxMarks     Decimal  @default(100.00) @map("max_marks") @db.Decimal(6, 2)
+  passMarks    Decimal  @default(33.00) @map("pass_marks") @db.Decimal(6, 2)
+  instructions String?  @db.VarChar(1000)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  exam        Exam    @relation("ExamSchedules", fields: [schoolId, examId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_exam_schedule_exam")
+  subject     Subject @relation("SubjectExamSchedules", fields: [schoolId, subjectId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_schedule_subject")
+  section     Section @relation("SectionExamSchedules", fields: [schoolId, sectionId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_schedule_section")
+  room        Room?   @relation("RoomExamSchedules", fields: [schoolId, roomId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_schedule_room")
+  invigilator Staff?  @relation("StaffInvigilatedExamSchedules", fields: [schoolId, invigilatorStaffId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_schedule_invigilator")
+
+  @@id([schoolId, id])
+  @@index([schoolId, examId], map: "ix_exam_schedule_school_exam")
+  @@index([schoolId, examId, date], map: "ix_exam_schedule_school_exam_date")
+  @@index([schoolId, sectionId, date], map: "ix_exam_schedule_school_section_date")
+  @@index([schoolId, deletedAt], map: "ix_exam_schedule_deleted_at")
+  @@map("exam_schedules")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model ExamMarks {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  examId    String @map("exam_id") @db.Char(36)
+  studentId String @map("student_id") @db.Char(36)
+  subjectId String @map("subject_id") @db.Char(36)
+  sectionId String @map("section_id") @db.Char(36)
+
+  marksObtained Decimal? @map("marks_obtained") @db.Decimal(6, 2)
+  isAbsent      Boolean  @default(false) @map("is_absent")
+  remarks       String?  @db.VarChar(500)
+  enteredAt     DateTime @map("entered_at") @db.Timestamp(3)
+  enteredBy     String?  @map("entered_by") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  // Optimistic-lock counter — bumped on every PUT.
+  version   Int       @default(1)
+
+  exam    Exam    @relation("ExamMarksByExam", fields: [schoolId, examId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_exam_marks_exam")
+  student Student @relation("StudentExamMarks", fields: [schoolId, studentId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_marks_student")
+  subject Subject @relation("SubjectExamMarks", fields: [schoolId, subjectId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_marks_subject")
+  section Section @relation("SectionExamMarks", fields: [schoolId, sectionId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_marks_section")
+
+  history ExamMarksEditHistory[] @relation("ExamMarksHistoryEntries")
+
+  @@id([schoolId, id])
+  @@index([schoolId, examId, sectionId, subjectId], map: "ix_exam_marks_school_exam_section_subject")
+  @@index([schoolId, studentId], map: "ix_exam_marks_school_student")
+  @@index([schoolId, deletedAt], map: "ix_exam_marks_deleted_at")
+  @@map("exam_marks")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model ExamMarksEditHistory {
+  // APPEND_ONLY. Every marks mutation writes a new row; reads only.
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  examMarksId String @map("exam_marks_id") @db.Char(36)
+
+  previousMarks    Decimal?            @map("previous_marks") @db.Decimal(6, 2)
+  newMarks         Decimal?            @map("new_marks") @db.Decimal(6, 2)
+  previousIsAbsent Boolean             @map("previous_is_absent")
+  newIsAbsent      Boolean             @map("new_is_absent")
+  changeType       ExamMarksChangeType @map("change_type")
+  changedBy        String?             @map("changed_by") @db.Char(36)
+  changedAt        DateTime            @default(now()) @map("changed_at") @db.Timestamp(3)
+  reason           String?             @db.VarChar(255)
+
+  examMarks ExamMarks @relation("ExamMarksHistoryEntries", fields: [schoolId, examMarksId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_exam_marks_history_marks")
+
+  @@id([schoolId, id])
+  @@index([schoolId, examMarksId, changedAt(sort: Desc)], map: "ix_exam_marks_history_school_marks_changed")
+  @@map("exam_marks_edit_history")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model ExamResult {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  examId    String @map("exam_id") @db.Char(36)
+  studentId String @map("student_id") @db.Char(36)
+  sectionId String @map("section_id") @db.Char(36)
+
+  totalMarksObtained Decimal          @default(0.00) @map("total_marks_obtained") @db.Decimal(8, 2)
+  totalMaxMarks      Decimal          @default(0.00) @map("total_max_marks") @db.Decimal(8, 2)
+  percentage         Decimal          @default(0.00) @db.Decimal(5, 2)
+  gradeLetter        String?          @map("grade_letter") @db.VarChar(8)
+  gradePoint         Decimal?         @map("grade_point") @db.Decimal(4, 2)
+  status             ExamResultStatus @default(COMPUTED)
+  isPassed           Boolean          @default(false) @map("is_passed")
+  computedAt         DateTime         @map("computed_at") @db.Timestamp(3)
+  computedBy         String?          @map("computed_by") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  exam    Exam    @relation("ExamResultsByExam", fields: [schoolId, examId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_exam_result_exam")
+  student Student @relation("StudentExamResults", fields: [schoolId, studentId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_result_student")
+  section Section @relation("SectionExamResults", fields: [schoolId, sectionId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_result_section")
+
+  subjects ExamSubjectResult[] @relation("ExamResultSubjects")
+
+  @@id([schoolId, id])
+  @@index([schoolId, examId, sectionId], map: "ix_exam_result_school_exam_section")
+  @@index([schoolId, studentId], map: "ix_exam_result_school_student")
+  @@index([schoolId, deletedAt], map: "ix_exam_result_deleted_at")
+  @@map("exam_results")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model ExamSubjectResult {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  examResultId String @map("exam_result_id") @db.Char(36)
+  subjectId    String @map("subject_id") @db.Char(36)
+
+  marksObtained Decimal? @map("marks_obtained") @db.Decimal(6, 2)
+  maxMarks      Decimal  @default(100.00) @map("max_marks") @db.Decimal(6, 2)
+  percentage    Decimal? @db.Decimal(5, 2)
+  isAbsent      Boolean  @default(false) @map("is_absent")
+  isPassed      Boolean  @default(false) @map("is_passed")
+  gradeLetter   String?  @map("grade_letter") @db.VarChar(8)
+  gradePoint    Decimal? @map("grade_point") @db.Decimal(4, 2)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  result  ExamResult @relation("ExamResultSubjects", fields: [schoolId, examResultId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_exam_subject_result_result")
+  subject Subject    @relation("SubjectExamSubjectResults", fields: [schoolId, subjectId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_exam_subject_result_subject")
+
+  @@id([schoolId, id])
+  @@index([schoolId, examResultId], map: "ix_exam_subject_result_school_result")
+  @@index([schoolId, subjectId], map: "ix_exam_subject_result_school_subject")
+  @@index([schoolId, deletedAt], map: "ix_exam_subject_result_deleted_at")
+  @@map("exam_subject_results")
+}

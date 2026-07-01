@@ -1,0 +1,8 @@
+dist
+coverage
+node_modules
+*.md
+package-lock.json
+.env*
+docker
+.github

@@ -1,0 +1,310 @@
+// ---------------------------------------------------------------------------
+// subscriptions.prisma — Sprint 15 SaaS Subscription & Plan Management
+// Foundation.
+//
+// Six models, six enums. Implements:
+//   - PlanFeature           (PLATFORM_ONLY, soft-delete) — per-plan feature
+//                            configuration. Carries both LIMIT (numeric cap)
+//                            and TOGGLE (boolean) feature types.
+//   - Subscription          (TENANT_OWNED, soft-delete) — one row per
+//                            (school, lifecycle). STORED `active_key` +
+//                            UNIQUE enforces at most one ACTIVE subscription
+//                            per school at any time.
+//   - SubscriptionHistory   (TENANT_OWNED, APPEND_ONLY) — every state change.
+//   - SchoolUsage           (TENANT_OWNED, singleton) — per-school usage
+//                            aggregate counters (students, staff, branches,
+//                            sms/email/whatsapp, storage bytes).
+//   - UsageEvent            (TENANT_OWNED, APPEND_ONLY) — delta ledger that
+//                            backs the SchoolUsage aggregate (used by the
+//                            `recompute` reconciliation path).
+//   - UsageThresholdState   (TENANT_OWNED, singleton per (school, key)) —
+//                            edge-trigger guard for the 80/90/100% usage
+//                            notification events.
+//
+// Billing/invoicing/payments are explicitly OUT of scope for this sprint.
+// ---------------------------------------------------------------------------
+
+/// Sprint 15 — discriminator on PlanFeature. LIMIT carries a numeric cap;
+/// TOGGLE is a pure on/off bit.
+enum FeatureType {
+  LIMIT
+  TOGGLE
+}
+
+/// Sprint 15 — mode column on PlanFeature.
+///   LIMIT type uses LIMITED (limit set) | UNLIMITED | DISABLED
+///   TOGGLE type uses ENABLED | DISABLED
+enum FeatureMode {
+  LIMITED
+  UNLIMITED
+  DISABLED
+  ENABLED
+}
+
+/// Sprint 15 — subscription lifecycle. PENDING is the seed state when a
+/// plan is assigned but not yet trial-/active-onboarded. EXPIRING is a soft
+/// pre-expiry warning state used by the daily expiry scheduler.
+enum SubscriptionStatus {
+  PENDING
+  TRIAL
+  ACTIVE
+  EXPIRING
+  EXPIRED
+  SUSPENDED
+  CANCELLED
+}
+
+/// Sprint 15 — billing cycle. TRIAL is a soft cycle for the trial period
+/// (no real money trail); CUSTOM is a placeholder for sales-led contracts.
+enum BillingCycle {
+  MONTHLY
+  YEARLY
+  TRIAL
+  CUSTOM
+}
+
+/// Sprint 15 — action recorded on SubscriptionHistory. Covers every
+/// lifecycle move from creation through cancellation.
+enum SubscriptionAction {
+  ASSIGNED
+  ACTIVATED
+  UPGRADED
+  DOWNGRADED
+  RENEWED
+  EXPIRING
+  EXPIRED
+  SUSPENDED
+  REACTIVATED
+  CANCELLED
+}
+
+/// Sprint 15 — last notified threshold band on UsageThresholdState. The
+/// guard fires `USAGE_THRESHOLD_REACHED` only when the new band is strictly
+/// greater than the persisted band; same band → no duplicate notification.
+enum UsageThreshold {
+  THRESHOLD_80
+  THRESHOLD_90
+  LIMIT_REACHED
+}
+
+// ---------------------------------------------------------------------------
+// PlanFeature — PLATFORM_ONLY catalog of per-plan, per-feature settings.
+// ---------------------------------------------------------------------------
+
+/// @scope PLATFORM_ONLY
+/// @softDelete
+/// @audit category=tenancy
+///
+/// Sprint 15 — single table covering both LIMIT and TOGGLE feature kinds.
+/// `featureType` is the discriminator; `mode` then constrains to LIMITED/
+/// UNLIMITED/DISABLED for LIMIT and ENABLED/DISABLED for TOGGLE. `limit` is
+/// only populated when `mode = LIMITED`. Soft-delete via `deletedAt` and the
+/// STORED `deleted_at_key` projection keeps uniqueness on (plan, featureKey)
+/// active-row-only without dropping history.
+model PlanFeature {
+  id          String      @id @default(uuid()) @db.Char(36)
+  planId      String      @map("plan_id") @db.Char(36)
+  featureKey  String      @map("feature_key") @db.VarChar(80)
+  featureType FeatureType @map("feature_type")
+  mode        FeatureMode
+  // BIGINT-backed so storage limits (bytes) can hold PB-scale values without
+  // overflowing INT (~2.1 GB max). All non-storage LIMIT keys (student_count,
+  // staff_count, branch_count, sms/whatsapp/email monthly) still fit
+  // comfortably in BIGINT and round-trip safely through JS Number at the repo
+  // boundary (safe up to ~9 PB; well above any realistic plan limit).
+  limit       BigInt?
+  sortOrder   Int         @default(0) @map("sort_order")
+  description String?     @db.VarChar(500)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  plan Plan @relation("PlanPlanFeatures", fields: [planId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_plan_features_plan")
+
+  @@index([planId, featureType, sortOrder], map: "ix_plan_features_plan")
+  @@index([deletedAt], map: "ix_plan_features_deleted_at")
+  @@map("plan_features")
+}
+
+// ---------------------------------------------------------------------------
+// Subscription — TENANT_OWNED, soft-delete, composite PK. STORED `active_key`
+// guarantees at most one ACTIVE row per school via UNIQUE index.
+// ---------------------------------------------------------------------------
+
+/// @scope TENANT_OWNED
+/// @softDelete
+/// @audit category=tenancy
+///
+/// Sprint 15 — authoritative subscription row. The STORED `active_key` is
+/// declared in the migration SQL (Prisma cannot model `GENERATED ALWAYS AS`
+/// STORED columns) and carries `schoolId` when `status = 'ACTIVE'`, NULL
+/// otherwise. The UNIQUE index on `active_key` is the structural enforcement
+/// of "one ACTIVE subscription per school". Application code soft-cancels
+/// the previous ACTIVE row before assigning a new plan.
+model Subscription {
+  id           String             @default(uuid()) @db.Char(36)
+  schoolId     String             @map("school_id") @db.Char(36)
+  planId       String             @map("plan_id") @db.Char(36)
+  status       SubscriptionStatus @default(PENDING)
+  billingCycle BillingCycle       @map("billing_cycle")
+  currency     String             @default("INR") @db.Char(3)
+  monthlyPrice Decimal            @default(0) @map("monthly_price") @db.Decimal(12, 2)
+  yearlyPrice  Decimal            @default(0) @map("yearly_price") @db.Decimal(12, 2)
+
+  assignedBy         String?   @map("assigned_by") @db.Char(36)
+  assignedAt         DateTime? @map("assigned_at") @db.Timestamp(3)
+  startedAt          DateTime? @map("started_at") @db.Timestamp(3)
+  expiryDate         DateTime? @map("expiry_date") @db.Timestamp(3)
+  cancelledAt        DateTime? @map("cancelled_at") @db.Timestamp(3)
+  cancellationReason String?   @map("cancellation_reason") @db.VarChar(500)
+  trialEndsAt        DateTime? @map("trial_ends_at") @db.Timestamp(3)
+  lastRenewedAt      DateTime? @map("last_renewed_at") @db.Timestamp(3)
+  nextRenewalAt      DateTime? @map("next_renewal_at") @db.Timestamp(3)
+  autoRenew          Boolean   @default(false) @map("auto_renew")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  plan    Plan                  @relation("PlanSubscriptions", fields: [planId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "fk_subscriptions_plan")
+  history SubscriptionHistory[] @relation("SubscriptionHistory")
+
+  @@id([schoolId, id])
+  @@index([schoolId, status], map: "ix_subscriptions_school_status")
+  @@index([status, expiryDate], map: "ix_subscriptions_expiry")
+  @@index([planId], map: "ix_subscriptions_plan")
+  @@index([deletedAt], map: "ix_subscriptions_deleted_at")
+  @@map("subscriptions")
+}
+
+// ---------------------------------------------------------------------------
+// SubscriptionHistory — TENANT_OWNED, APPEND_ONLY journal.
+// ---------------------------------------------------------------------------
+
+/// @scope TENANT_OWNED
+/// @audit immutable
+///
+/// Sprint 15 — append-only history of every state change applied to a
+/// Subscription. Mirrors the auth UserLoginEvent pattern: no updatedAt,
+/// no version, no soft-delete.
+model SubscriptionHistory {
+  id             String             @default(uuid()) @db.Char(36)
+  schoolId       String             @map("school_id") @db.Char(36)
+  subscriptionId String             @map("subscription_id") @db.Char(36)
+  action         SubscriptionAction
+  fromPlanId     String?            @map("from_plan_id") @db.Char(36)
+  toPlanId       String?            @map("to_plan_id") @db.Char(36)
+  fromStatus     String?            @map("from_status") @db.VarChar(20)
+  toStatus       String?            @map("to_status") @db.VarChar(20)
+  actorUserId    String?            @map("actor_user_id") @db.Char(36)
+  actorReason    String?            @map("actor_reason") @db.VarChar(500)
+  metadataJson   Json?              @map("metadata_json")
+  occurredAt     DateTime           @default(now()) @map("occurred_at") @db.Timestamp(3)
+
+  subscription Subscription @relation("SubscriptionHistory", fields: [schoolId, subscriptionId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_subscription_history_subscription")
+
+  @@id([schoolId, id])
+  @@index([schoolId, subscriptionId, occurredAt], map: "ix_subscription_history_subscription")
+  @@map("subscription_history")
+}
+
+// ---------------------------------------------------------------------------
+// SchoolUsage — TENANT_OWNED singleton per school with mutable counters.
+// ---------------------------------------------------------------------------
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+///
+/// Sprint 15 — per-school aggregate counters. NOT soft-deleted (deletion
+/// would orphan the running window) and NOT APPEND_ONLY (counters mutate
+/// on every consume). UsageEvent is the per-delta ledger that backs
+/// `recompute()`.
+model SchoolUsage {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  studentCount Int @default(0) @map("student_count")
+  staffCount   Int @default(0) @map("staff_count")
+  branchCount  Int @default(0) @map("branch_count")
+
+  smsUsedThisPeriod      Int    @default(0) @map("sms_used_this_period")
+  whatsappUsedThisPeriod Int    @default(0) @map("whatsapp_used_this_period")
+  emailUsedThisPeriod    Int    @default(0) @map("email_used_this_period")
+  storageBytesUsed       BigInt @default(0) @map("storage_bytes_used")
+
+  usagePeriodStart DateTime  @map("usage_period_start") @db.Date
+  usagePeriodEnd   DateTime  @map("usage_period_end") @db.Date
+  lastRecomputedAt DateTime? @map("last_recomputed_at") @db.Timestamp(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  @@id([schoolId, id])
+  @@unique([schoolId], map: "uq_school_usage_school")
+  @@map("school_usage")
+}
+
+// ---------------------------------------------------------------------------
+// UsageEvent — TENANT_OWNED, APPEND_ONLY delta ledger.
+// ---------------------------------------------------------------------------
+
+/// @scope TENANT_OWNED
+/// @audit immutable
+///
+/// Sprint 15 — write-once event per consume/release. `delta` is the signed
+/// delta applied to the matching counter on SchoolUsage. `sourceRef` is a
+/// free-form pointer (e.g. `student:<id>`) so future audits can trace back
+/// to the originating row.
+model UsageEvent {
+  id          String   @default(uuid()) @db.Char(36)
+  schoolId    String   @map("school_id") @db.Char(36)
+  featureKey  String   @map("feature_key") @db.VarChar(80)
+  delta       Int
+  actorUserId String?  @map("actor_user_id") @db.Char(36)
+  sourceRef   String?  @map("source_ref") @db.VarChar(200)
+  occurredAt  DateTime @default(now()) @map("occurred_at") @db.Timestamp(3)
+
+  @@id([schoolId, id])
+  @@index([schoolId, featureKey, occurredAt], map: "ix_usage_events_school_key_time")
+  @@map("usage_events")
+}
+
+// ---------------------------------------------------------------------------
+// UsageThresholdState — TENANT_OWNED singleton per (school, featureKey).
+// ---------------------------------------------------------------------------
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+///
+/// Sprint 15 — edge-trigger memory for the 80%/90%/100% usage notification
+/// bands. The guard performs an atomic compare-and-set against
+/// `lastNotifiedThreshold` so the same band never fires twice. Reset
+/// semantics (when the usage period rolls over) are owned by Sprint 16.
+model UsageThresholdState {
+  id                    String          @default(uuid()) @db.Char(36)
+  schoolId              String          @map("school_id") @db.Char(36)
+  featureKey            String          @map("feature_key") @db.VarChar(80)
+  lastNotifiedThreshold UsageThreshold? @map("last_notified_threshold")
+  lastNotifiedAt        DateTime?       @map("last_notified_at") @db.Timestamp(3)
+  currentPercent        Int             @default(0) @map("current_percent")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  version   Int      @default(1)
+
+  @@id([schoolId, id])
+  @@unique([schoolId, featureKey], map: "uq_usage_threshold_school_key")
+  @@map("usage_threshold_state")
+}

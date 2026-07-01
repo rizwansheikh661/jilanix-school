@@ -1,0 +1,121 @@
+// ---------------------------------------------------------------------------
+// branches.prisma — Branch hierarchy (Sprint 4.5).
+//
+// A `Branch` is a physical location where the school operates: main campus,
+// north wing, satellite premises. Today's TENANT_OWNED rows scope by
+// `schoolId` only; once a school adds a second branch, downstream sprints
+// (Students/Staff/Classes) will add `branchId` columns. This sprint ships
+// only the Branch + BranchSettings tables so the column additions can be
+// non-disruptive and incremental.
+//
+// Conventions:
+//   - Composite PK `(schoolId, id)`.
+//   - User-supplied `code` (no TenantSequence integration). Service enforces
+//     `(schoolId, code)` unique per school.
+//   - Self-referential parent for hierarchical branches (campus → wing).
+//   - Single primary branch per school enforced in BranchService (pre-flight
+//     demote in same tx; MySQL has no partial unique).
+// ---------------------------------------------------------------------------
+
+enum BranchStatus {
+  ACTIVE
+  INACTIVE
+  CLOSED
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=tenancy
+model Branch {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  // Self-ref hierarchical parent — null for top-level branches.
+  parentBranchId String? @map("parent_branch_id") @db.Char(36)
+
+  code      String       @db.VarChar(20)
+  name      String       @db.VarChar(100)
+  // Service-level rule: exactly one isPrimary=true per school.
+  isPrimary Boolean      @default(false) @map("is_primary")
+  status    BranchStatus @default(ACTIVE)
+
+  // Address — optional; the school-level address in `schools` is the
+  // default when these are null.
+  addressLine1 String? @map("address_line1") @db.VarChar(255)
+  addressLine2 String? @map("address_line2") @db.VarChar(255)
+  city         String? @db.VarChar(100)
+  stateCode    String? @map("state_code") @db.VarChar(10)
+  pincode      String? @db.VarChar(10)
+  phone        String? @db.VarChar(20)
+  email        String? @db.VarChar(255)
+
+  establishedDate DateTime? @map("established_date") @db.Date
+  // Optional pointer to a Staff row managing this branch. Restrict on staff
+  // delete (composite FK with required schoolId rules out SetNull) — service
+  // clears manager refs before deleting a staff member.
+  managerStaffId  String?   @map("manager_staff_id") @db.Char(36)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  parent   Branch?  @relation("BranchHierarchy", fields: [schoolId, parentBranchId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_branch_parent")
+  children Branch[] @relation("BranchHierarchy")
+  manager  Staff?   @relation("StaffManagedBranches", fields: [schoolId, managerStaffId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_branch_manager")
+
+  settings                  BranchSettings?
+  rooms                     Room[]                     @relation("BranchRooms")
+  departments               Department[]               @relation("BranchDepartments")
+  workingDaysConfigurations WorkingDaysConfiguration[] @relation("BranchWorkingDays")
+  calendarEvents            CalendarEvent[]            @relation("BranchCalendarEvents")
+  holidays                  Holiday[]                  @relation("BranchHolidays")
+  // Sprint 6 — attendance reverse relations.
+  attendanceDaily           AttendanceDaily[]          @relation("BranchAttendanceDaily")
+  staffAttendance           StaffAttendance[]          @relation("BranchStaffAttendance")
+  attendanceLocks           AttendanceLockWindow[]     @relation("BranchAttendanceLocks")
+  attendanceConfigs         AttendanceConfig[]         @relation("BranchAttendanceConfig")
+  // Sprint 7 — timetable reverse relations.
+  periodTemplates           PeriodTemplate[]           @relation("BranchPeriodTemplates")
+  timetableVersions         TimetableVersion[]         @relation("BranchTimetableVersions")
+  // Sprint 8 — examination reverse relations.
+  exams                     Exam[]                     @relation("BranchExams")
+  // Sprint 9 — fees reverse relations.
+  feeStructures             FeeStructure[]             @relation("BranchFeeStructures")
+  feeInvoices               FeeInvoice[]               @relation("BranchFeeInvoices")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, code], map: "uq_branch_school_code")
+  @@index([schoolId, status], map: "ix_branch_school_status")
+  @@index([schoolId, isPrimary], map: "ix_branch_school_primary")
+  @@index([schoolId, parentBranchId], map: "ix_branch_school_parent")
+  @@map("branches")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=tenancy
+model BranchSettings {
+  schoolId String @map("school_id") @db.Char(36)
+  branchId String @map("branch_id") @db.Char(36)
+
+  // Optional per-branch override for `school_settings.working_days_json`.
+  workingDaysJson               Json?   @map("working_days_json")
+  // Free-form period bell schedule blob; consumed by Timetable in Sprint 12.
+  periodSettingsJson            Json?   @map("period_settings_json")
+  // Override `school_settings.attendance_window_hours` per branch.
+  attendanceWindowOverrideHours Int?    @map("attendance_window_override_hours")
+  primaryLanguage               String? @map("primary_language") @db.VarChar(40)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  branch Branch @relation(fields: [schoolId, branchId], references: [schoolId, id], onDelete: Cascade, onUpdate: Restrict, map: "fk_branch_settings_branch")
+
+  @@id([schoolId, branchId])
+  @@map("branch_settings")
+}

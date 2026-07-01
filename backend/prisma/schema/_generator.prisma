@@ -1,0 +1,36 @@
+// ---------------------------------------------------------------------------
+// _generator.prisma — Prisma client + datasource configuration.
+//
+// Files in this folder are merged by Prisma's multi-file schema feature
+// (GA in Prisma 6). Splitting by domain keeps any one file small enough to
+// review in isolation; cross-file relations work without imports because
+// model names are global within the schema.
+//
+// Naming follows PRISMA_STRATEGY.md:
+//   - PascalCase singular models, snake_plural physical tables (`@@map`)
+//   - camelCase fields, snake_case columns (`@map`)
+//   - Composite PK `@@id([schoolId, id])` on every TENANT_OWNED model
+//   - Soft-delete via `deletedAt` (rewritten by softDeleteExt)
+//
+// Annotations parsed by extensions at boot:
+//   /// @scope {PLATFORM_ONLY|TENANT_OWNED|TENANT_SHARED_PLATFORM|...}
+//   /// @softDelete
+//   /// @audit category=<...> sensitiveFields=<...>
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider        = "prisma-client-js"
+  // GA in Prisma 6 — no preview flag required. Pinned here so `prisma
+  // generate` will fail loudly if the package gets downgraded.
+  previewFeatures = []
+  engineType      = "library"
+}
+
+datasource db {
+  provider     = "mysql"
+  url          = env("DB_URL")
+  // Use Prisma-managed FKs (default). Switching to `prisma` mode would
+  // disable in-DB referential integrity, which we rely on as defense in
+  // depth alongside the tenant-scope extension.
+  relationMode = "foreignKeys"
+}

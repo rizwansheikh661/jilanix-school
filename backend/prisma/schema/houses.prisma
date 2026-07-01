@@ -1,0 +1,93 @@
+// ---------------------------------------------------------------------------
+// houses.prisma — Student Houses & assignments (Sprint 4.5).
+//
+// "Houses" are co-curricular groupings (Red/Blue/Green/Yellow at most schools)
+// used for inter-house competitions, sports days, and student leadership.
+// One student belongs to one house per academic year.
+//
+// Two tables:
+//   - `House`            — master row. Code/name/colour, optional captain
+//                          and vice-captain pointers, optional photo.
+//   - `HouseAssignment`  — append-only history. Re-assigning a student
+//                          stamps `endedOn` on the prior row and inserts a
+//                          new one in the same tx (service-level — no
+//                          partial uniques in MySQL). The current house is
+//                          also denormalised onto `students.house_id` for
+//                          fast filtering on student-list screens.
+// ---------------------------------------------------------------------------
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model House {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  code     String  @db.VarChar(20)
+  name     String  @db.VarChar(60)
+  // Hex code — DTO validates ^#[0-9A-F]{6}$.
+  colorHex String  @map("color_hex") @db.Char(7)
+  motto    String? @db.VarChar(255)
+
+  // Optional — leadership pointers. SetNull if the student leaves so the
+  // house survives a captain transfer.
+  captainStudentId     String? @map("captain_student_id") @db.Char(36)
+  viceCaptainStudentId String? @map("vice_captain_student_id") @db.Char(36)
+
+  photoUrl  String? @map("photo_url") @db.VarChar(1000)
+  sortOrder Int     @default(0) @map("sort_order")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  captain     Student? @relation("HouseCaptain", fields: [schoolId, captainStudentId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_house_captain")
+  viceCaptain Student? @relation("HouseViceCaptain", fields: [schoolId, viceCaptainStudentId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_house_vice_captain")
+
+  members     Student[]         @relation("StudentHouse")
+  assignments HouseAssignment[] @relation("HouseAssignments")
+
+  @@id([schoolId, id])
+  @@unique([schoolId, code], map: "uq_house_school_code")
+  @@index([schoolId, sortOrder], map: "ix_house_school_sort")
+  @@map("houses")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model HouseAssignment {
+  id       String @default(uuid()) @db.Char(36)
+  schoolId String @map("school_id") @db.Char(36)
+
+  studentId      String @map("student_id") @db.Char(36)
+  houseId        String @map("house_id") @db.Char(36)
+  academicYearId String @map("academic_year_id") @db.Char(36)
+
+  assignedOn DateTime  @map("assigned_on") @db.Date
+  // When set, this row no longer represents the active assignment. Service
+  // sets it on re-assignment within the same year.
+  endedOn    DateTime? @map("ended_on") @db.Date
+  reason     String?   @db.VarChar(255)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  createdBy String?  @map("created_by") @db.Char(36)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  updatedBy String?  @map("updated_by") @db.Char(36)
+  version   Int      @default(1)
+
+  student      Student      @relation("StudentHouseAssignments", fields: [schoolId, studentId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_house_assign_student")
+  house        House        @relation("HouseAssignments", fields: [schoolId, houseId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_house_assign_house")
+  academicYear AcademicYear @relation("AcademicYearHouseAssignments", fields: [schoolId, academicYearId], references: [schoolId, id], onDelete: Restrict, onUpdate: Restrict, map: "fk_house_assign_year")
+
+  @@id([schoolId, id])
+  // One ACTIVE assignment per (year, student) is enforced in the service —
+  // MySQL has no partial unique. This regular unique covers full row
+  // uniqueness so duplicates can't sneak in from race conditions.
+  @@unique([schoolId, academicYearId, studentId, assignedOn], map: "uq_house_assignment_year_student_assigned")
+  @@index([schoolId, houseId, academicYearId], map: "ix_house_assignment_school_house_year")
+  @@index([schoolId, studentId], map: "ix_house_assignment_school_student")
+  @@map("house_assignments")
+}

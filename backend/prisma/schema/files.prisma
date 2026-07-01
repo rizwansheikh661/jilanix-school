@@ -1,0 +1,128 @@
+// ---------------------------------------------------------------------------
+// files.prisma — File storage foundation (Sprint 5).
+//
+// `FileAsset` is the canonical metadata row for any binary the platform
+// stores: student photos, admission documents, school logos, message
+// attachments, report exports, bulk-import payloads. App code never touches
+// the underlying storage SDK directly — it goes through `StorageProvider`,
+// of which `LocalStorageProvider` (default) and `S3CompatibleStorageProvider`
+// (stub) are wired in Sprint 5. Adding AWS S3 / DO Spaces / Cloudflare R2 /
+// MinIO is config-only.
+//
+// `FileAssetAclGrant` is a per-asset access list (USER | ROLE | PUBLIC).
+// Revocation is soft via `revoked_at`; unique-while-active is enforced via
+// a STORED generated column `revoked_key` (Prisma can't emit GENERATED
+// columns — added in the migration, mirroring `working_days_configuration
+// .branch_key`).
+//
+// Scope: FileAsset is TENANT_SHARED_PLATFORM (`school_id` nullable so
+// platform-owned assets like generic logos can sit here too). ACL grants
+// follow the asset's tenancy — `school_id` is denormalised onto the row.
+// ---------------------------------------------------------------------------
+
+enum FilePurpose {
+  STUDENT_PHOTO
+  STAFF_PHOTO
+  ADMISSION_DOCUMENT
+  SCHOOL_DOCUMENT
+  SCHOOL_LOGO
+  MESSAGE_ATTACHMENT
+  REPORT_EXPORT
+  BULK_IMPORT
+  EVENT_DOCUMENT
+  HOMEWORK_ATTACHMENT
+  ASSIGNMENT_ATTACHMENT
+  ASSIGNMENT_SUBMISSION
+  OTHER
+}
+
+enum FileScanStatus {
+  PENDING
+  CLEAN
+  INFECTED
+  SCAN_FAILED
+}
+
+enum FilePrincipalType {
+  USER
+  ROLE
+  PUBLIC
+}
+
+/// @scope TENANT_SHARED_PLATFORM
+/// @audit category=tenancy
+model FileAsset {
+  id       String  @id @default(uuid()) @db.Char(36)
+  schoolId String? @map("school_id") @db.Char(36)
+
+  purpose        FilePurpose
+  bucket         String      @db.VarChar(100)
+  storageKey     String      @map("storage_key") @db.VarChar(500)
+  fileName       String      @map("file_name") @db.VarChar(255)
+  mimeType       String      @map("mime_type") @db.VarChar(100)
+  sizeBytes      BigInt      @map("size_bytes")
+  checksumSha256 String      @map("checksum_sha256") @db.Char(64)
+
+  isPublic        Boolean        @default(false) @map("is_public")
+  scanStatus      FileScanStatus @default(PENDING) @map("scan_status")
+  scanCompletedAt DateTime?      @map("scan_completed_at") @db.Timestamp(3)
+
+  // ownerUserId is the actor who created the asset. No FK because users live
+  // in a TENANT_OWNED table with composite PK and FileAsset can be platform-
+  // scoped (schoolId nullable) — simpler to keep this as an opaque pointer
+  // and resolve in app code where the tenant is known.
+  ownerUserId String?   @map("owner_user_id") @db.Char(36)
+  expiresAt   DateTime? @map("expires_at") @db.Timestamp(3)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamp(3)
+  createdBy String?   @map("created_by") @db.Char(36)
+  updatedBy String?   @map("updated_by") @db.Char(36)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamp(3)
+  deletedBy String?   @map("deleted_by") @db.Char(36)
+  version   Int       @default(1)
+
+  school    School?             @relation("SchoolFileAssets", fields: [schoolId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_file_asset_school")
+  aclGrants FileAssetAclGrant[] @relation("FileAssetAclGrants")
+
+  @@index([schoolId, purpose, createdAt(sort: Desc)], map: "ix_file_asset_school_purpose_created")
+  @@index([bucket, storageKey], map: "ix_file_asset_bucket_key")
+  @@index([ownerUserId], map: "ix_file_asset_owner")
+  @@index([scanStatus], map: "ix_file_asset_scan_status")
+  @@index([deletedAt], map: "ix_file_asset_deleted_at")
+  @@map("file_assets")
+}
+
+/// @scope TENANT_OWNED
+/// @audit category=general
+model FileAssetAclGrant {
+  id       String  @id @default(uuid()) @db.Char(36)
+  schoolId String? @map("school_id") @db.Char(36)
+
+  fileAssetId String @map("file_asset_id") @db.Char(36)
+
+  principalType FilePrincipalType @map("principal_type")
+  // Null when principalType=PUBLIC. CHAR(36) for USER/ROLE id otherwise.
+  principalId   String?           @map("principal_id") @db.Char(36)
+
+  grantedAt DateTime  @default(now()) @map("granted_at") @db.Timestamp(3)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamp(3)
+  // The actual unique-while-active is enforced via a STORED generated
+  // column `revoked_key` added in the migration:
+  //   COALESCE(DATE_FORMAT(revoked_at,'%Y%m%d%H%i%s'),'NONE')
+  // Keeping the index here non-unique so the absence of `revoked_key` in
+  // the Prisma model doesn't trip schema drift.
+  grantedBy String?   @map("granted_by") @db.Char(36)
+  revokedBy String?   @map("revoked_by") @db.Char(36)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamp(3)
+  version   Int      @default(1)
+
+  fileAsset FileAsset @relation("FileAssetAclGrants", fields: [fileAssetId], references: [id], onDelete: Cascade, onUpdate: Restrict, map: "fk_file_acl_file")
+
+  @@index([fileAssetId, principalType, principalId], map: "ix_file_acl_file_principal")
+  @@index([principalType, principalId], map: "ix_file_acl_principal")
+  @@index([schoolId], map: "ix_file_acl_school")
+  @@map("file_asset_acl_grants")
+}

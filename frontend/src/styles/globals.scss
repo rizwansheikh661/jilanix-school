@@ -1,0 +1,18 @@
+// ============================================================================
+// Global stylesheet entry — order matters.
+// 1) Bootstrap variable overrides (mapped to design tokens)
+// 2) Bootstrap (compiles using overridden variables)
+// 3) Our design tokens as CSS custom properties (for runtime/theme switching)
+// 4) Base reset / typography
+// 5) Layout
+// 6) Components
+// ============================================================================
+
+@import './bootstrap-overrides';
+@import 'bootstrap/scss/bootstrap';
+
+@import './tokens';
+@import './base';
+@import './layout';
+@import './components';
+@import './theme-jilanix-auth';
