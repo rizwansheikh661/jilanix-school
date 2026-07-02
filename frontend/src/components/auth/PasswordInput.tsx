@@ -1,17 +1,13 @@
 'use client';
 
 import { forwardRef, useState, type InputHTMLAttributes, type ReactNode } from 'react';
-import { Eye, EyeOff, Lock } from 'lucide-react';
+import { Eye, EyeOff } from 'lucide-react';
 
 /**
- * PasswordInput — Jilanix-styled password field with:
- *   - leading lock icon (default; overridable via `leadingIcon`)
+ * PasswordInput — clean password field with:
  *   - trailing eye/eye-off toggle that flips `type` between
  *     `password` and `text`
  *   - accessible label + inline error line
- *
- * Ref forwards to the underlying `<input>` so `react-hook-form`'s
- * `register(...)` binding keeps working unchanged.
  */
 interface PasswordInputProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 'type'> {
   readonly label: string;
@@ -24,9 +20,9 @@ export const PasswordInput = forwardRef<HTMLInputElement, PasswordInputProps>(
     const [visible, setVisible] = useState(false);
     const inputId = id ?? rest.name;
     const invalid = Boolean(errorMessage);
-    const icon = leadingIcon ?? <Lock size={18} aria-hidden="true" />;
     const classes = [
       'jlx-field__input',
+      'jlx-field__input--no-icon',
       'jlx-field__input--with-trailing',
       className ?? '',
     ]
@@ -39,7 +35,6 @@ export const PasswordInput = forwardRef<HTMLInputElement, PasswordInputProps>(
           {label}
         </label>
         <div className="jlx-field__control">
-          <span className="jlx-field__icon">{icon}</span>
           <input
             {...rest}
             id={inputId}
@@ -56,7 +51,7 @@ export const PasswordInput = forwardRef<HTMLInputElement, PasswordInputProps>(
             aria-label={visible ? 'Hide password' : 'Show password'}
             aria-pressed={visible}
           >
-            {visible ? <Eye size={18} aria-hidden="true" /> : <EyeOff size={18} aria-hidden="true" />}
+            {visible ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}
           </button>
         </div>
         {errorMessage ? (

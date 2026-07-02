@@ -5,7 +5,6 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { Mail } from 'lucide-react';
 
 import { useAuth } from '@/providers/AuthProvider';
 import { useToast } from '@/providers/ToastProvider';
@@ -66,21 +65,14 @@ export function LoginForm() {
     <AuthLayout>
       <AuthCard
         title="Welcome back"
-        subtitle="Sign in to continue to your account"
-        footer={
-          <>
-            Don&rsquo;t have an account?{' '}
-            <span className="jlx-link-accent">Contact your administrator</span>
-          </>
-        }
+        subtitle="Sign in to your school portal"
       >
         <form className="jlx-auth-card__form" onSubmit={handleSubmit(onSubmit)} noValidate>
           <AuthInput
             label="Email address"
             type="email"
             autoComplete="email"
-            placeholder="Enter your email address"
-            leadingIcon={<Mail size={18} aria-hidden="true" />}
+            placeholder="you@school.edu"
             errorMessage={errors.email?.message}
             {...register('email')}
           />
@@ -88,7 +80,7 @@ export function LoginForm() {
           <PasswordInput
             label="Password"
             autoComplete="current-password"
-            placeholder="Enter your password"
+            placeholder="••••••••"
             errorMessage={errors.password?.message}
             {...register('password')}
           />

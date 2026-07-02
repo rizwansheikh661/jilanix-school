@@ -24,7 +24,11 @@ export function AuthLayout({ children }: AuthLayoutProps) {
       <main className="jlx-auth-shell__panel">
         <div className="jlx-auth-shell__panel-body">{children}</div>
         <div className="jlx-auth-shell__panel-footer">
-          © {new Date().getFullYear()} Jilanix. All rights reserved.
+          <span>© {new Date().getFullYear()} Jilanix School OS</span>
+          <span className="jlx-auth-panel-footer__dot">·</span>
+          <a href="#" className="jlx-link-muted">Privacy</a>
+          <span className="jlx-auth-panel-footer__dot">·</span>
+          <a href="#" className="jlx-link-muted">Terms</a>
         </div>
       </main>
     </div>
